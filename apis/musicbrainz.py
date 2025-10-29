@@ -158,44 +158,37 @@ def get_artist_songs_by_mbid(
 
     return rows
 
-# helper (optional) if you still want an ISO field in the consumer
-def _iso_from_ymd(y, m, d) -> Optional[str]:
-    if y is None:
-        return None
-    if m is None:
-        return f"{y:04d}"
-    if d is None:
-        return f"{y:04d}-{m:02d}"
-    return f"{y:04d}-{m:02d}-{d:02d}"
+# helper: fast role-id → role-name translation (done client-side)
+def _map_roles_inplace(contributors: List[Dict[str, Any]], role_id_to_name: Dict[int, str]) -> None:
+    for c in contributors or []:
+        ids = c.pop("role_ids", []) or []
+        c["roles"] = [role_id_to_name.get(rid, str(rid)) for rid in ids]
 
 def stream_artists_songs_by_mbids(
     artist_mbids: Sequence[str],
     *,
-    unique_recordings: bool = True,      # kept for signature compatibility (ignored here)
-    path: str = "temp_table",            # "temp_table" (best for huge lists) or "unnest"
+    path: str = "temp_table",            # "temp_table" (best for huge cohorts) or "unnest"
     itersize: int = 50_000,              # rows fetched per round-trip
-    set_work_mem: Optional[str] = "256MB",  # None to skip (scoped to txn)
-    prefer_earliest: bool = False,       # kept for signature compatibility (ignored here)
+    set_work_mem: Optional[str] = "512MB",
+    disable_jit: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     """
-    Stream songs (works) CREATED by any of the given artists.
-    Returns minimal payload per (artist, work) row:
+    Stream songs (works) CREATED by any of the given artists, returning minimal fields:
 
       - song_title
-      - release_date_year, release_date_month, release_date_day
-      - contributors: JSONB array of {artist_mbid, artist_name, roles}
+      - release_date_year, release_date_month, release_date_day (from recording_first_release_date)
+      - contributors: [{artist_mbid, artist_name, roles: [str, ...]}]
 
     Notes:
-      - "Created" = artist has authorship relationship to the Work
-        (composer / lyricist / writer / librettist).
-      - Earliest date comes from recording_first_release_date across ANY
-        recording linked to the work (fast path).
-      - We intentionally avoid track/medium/release joins for speed.
+      - "Created" = the artist has an authorship relationship to the Work
+        (composer / lyricist / writer / librettist) via l_artist_work/link.
+      - One row per distinct Work across the whole cohort (deduped).
+      - No ORDER BY for maximum throughput; sort downstream if desired.
     """
     if not artist_mbids:
         return
 
-    # Validate UUIDs, preserve input order while deduping
+    # Validate & dedupe input while preserving order
     seen, cohort = set(), []
     for mbid in artist_mbids:
         UUID(mbid)
@@ -203,50 +196,71 @@ def stream_artists_songs_by_mbids(
             seen.add(mbid)
             cohort.append(mbid)
 
-    # roles that count as "created"
-    author_roles = ("composer", "lyricist", "writer", "librettist")
+    # Resolve authorship link_type IDs once (avoids per-row join to link_type)
+    AUTHOR_ROLE_NAMES = ("composer", "lyricist", "writer", "librettist")
 
-    # Core query: select authored works for cohort artists, compute earliest date from any recording,
-    # and aggregate contributors (all authors) as JSON.
-    #
-    # We output one row per (artist, work). If you prefer one row per work across all input artists,
-    # change the SELECT/GROUP BY at the bottom to drop artist fields.
-    def _make_sql(use_temp_table: bool) -> Tuple[str, Tuple[Any, ...]]:
-        if use_temp_table:
-            cohort_cte = "SELECT gid FROM tmp_artist_gid"
-            params: Tuple[Any, ...] = (list(author_roles),)
+    with _connect() as conn:
+        # Session-local performance knobs
+        with conn.cursor() as cset:
+            if set_work_mem:
+                cset.execute(sql.SQL("SET LOCAL work_mem = {}").format(sql.Literal(set_work_mem)))
+            if disable_jit:
+                cset.execute("SET LOCAL jit = off")
+            # Safe with TEMP writes; reduces fsync latency for this session
+            cset.execute("SET LOCAL synchronous_commit = off")
+
+        # Fetch link_type ids and build a mapping for client-side role name translation
+        with conn.cursor() as c_lt:
+            c_lt.execute(
+                "SELECT id, name FROM link_type WHERE name = ANY(%s)",
+                (list(AUTHOR_ROLE_NAMES),),
+            )
+            rows = c_lt.fetchall()
+            if not rows:
+                raise RuntimeError("Expected authorship link types not found.")
+            role_id_to_name = {r[0]: r[1] for r in rows}
+            role_ids = list(role_id_to_name.keys())  # used to filter lk.link_type
+
+        # Build cohort: TEMP table path (best for huge lists) or unnest
+        use_temp = (path != "unnest")
+        if use_temp:
+            with conn.cursor() as cprep:
+                cprep.execute("CREATE TEMP TABLE tmp_artist_gid (gid uuid PRIMARY KEY) ON COMMIT DROP")
+                with cprep.copy("COPY tmp_artist_gid (gid) FROM STDIN WITH (FORMAT text)") as cp:
+                    cp.write("\n".join(cohort) + "\n")
+                cprep.execute("ANALYZE tmp_artist_gid")
+                # Map UUIDs -> integer artist ids once; keep a narrow temp table of ints
+                cprep.execute("""
+                    CREATE TEMP TABLE tmp_artist_id AS
+                    SELECT a.id
+                    FROM artist a
+                    JOIN tmp_artist_gid g ON g.gid = a.gid
+                """)
+                cprep.execute("CREATE INDEX ON tmp_artist_id (id)")
+                cprep.execute("ANALYZE tmp_artist_id")
+
+        # Core (no ORDER BY): one row per distinct work authored by ANY cohort artist
+        if use_temp:
+            cohort_sql = "SELECT id FROM tmp_artist_id"
+            params: Tuple[Any, ...] = (role_ids,)
         else:
-            cohort_cte = "SELECT * FROM unnest(%s::uuid[])"
-            params = (list(author_roles), cohort)
+            cohort_sql = "SELECT a.id FROM artist a JOIN (SELECT * FROM unnest(%s::uuid[])) x(gid) ON a.gid = x.gid"
+            params = (cohort, role_ids)
 
         sql_text = f"""
-        WITH cohort(gid) AS ({cohort_cte}),
-        lt_auth AS (
-            SELECT id, name
-            FROM link_type
-            WHERE name = ANY (%s)
-        ),
-        -- map cohort artist gid -> id
-        cohort_artist AS (
-            SELECT a.id AS artist_id, a.gid AS artist_mbid, a.name AS artist_name
-            FROM artist a
-            JOIN cohort c ON c.gid = a.gid
-        ),
-        -- works authored by cohort artists
-        authored AS (
-            SELECT DISTINCT
-                ca.artist_id,
-                ca.artist_mbid,
-                ca.artist_name,
-                w.id   AS work_id,
-                w.name AS work_name
+        WITH cohort_artist(id) AS ({cohort_sql}),
+
+        -- Works authored by any cohort artist (deduped to one row per work)
+        authored_works AS (
+            SELECT DISTINCT w.id AS work_id, w.name AS work_name
             FROM cohort_artist ca
-            JOIN l_artist_work law ON law.entity0 = ca.artist_id
+            JOIN l_artist_work law ON law.entity0 = ca.id
             JOIN link lk           ON lk.id = law.link
-            JOIN lt_auth lt        ON lt.id = lk.link_type
             JOIN work w            ON w.id = law.entity1
+            WHERE lk.link_type = ANY (%s)
         ),
-        -- earliest known release-event date for ANY recording of each work
+
+        -- Earliest known (year, month, day) across ANY recording of the work
         work_first_date AS (
             SELECT work_id,
                    rfrd.year  AS release_date_year,
@@ -255,88 +269,63 @@ def stream_artists_songs_by_mbids(
                    ROW_NUMBER() OVER (
                        PARTITION BY work_id
                    ) AS rn
-            FROM authored a
-            JOIN l_recording_work lrw ON lrw.entity1 = a.work_id
+            FROM authored_works w
+            JOIN l_recording_work lrw ON lrw.entity1 = w.work_id
             JOIN recording r          ON r.id = lrw.entity0
             LEFT JOIN recording_first_release_date rfrd ON rfrd.recording = r.id
         ),
-        -- all contributors (authors) to each work as JSON
+
+        -- Pre-aggregate roles per (work, contributor-artist) using link_type IDs (no join to link_type)
+        role_sets AS (
+            SELECT
+                law.entity1                 AS work_id,
+                law.entity0                 AS artist_id,
+                array_agg(DISTINCT lk.link_type) AS role_ids
+            FROM l_artist_work law
+            JOIN link lk ON lk.id = law.link
+            WHERE lk.link_type = ANY (%s)
+            GROUP BY law.entity1, law.entity0
+        ),
+
+        -- Final contributor list per work (role_ids translated to names in Python)
         work_contrib AS (
             SELECT
-                a.work_id,
+                rs.work_id,
                 jsonb_agg(
-                    DISTINCT jsonb_build_object(
+                    jsonb_build_object(
                         'artist_mbid', ar.gid,
                         'artist_name', ar.name,
-                        'roles',
-                        (
-                          SELECT array_agg(DISTINCT lt3.name)
-                          FROM l_artist_work law3
-                          JOIN link lk3  ON lk3.id = law3.link
-                          JOIN lt_auth lt3 ON lt3.id = lk3.link_type
-                          WHERE law3.entity1 = a.work_id AND law3.entity0 = ar.id
-                        )
+                        'role_ids',    rs.role_ids
                     )
                 ) AS contributors
-            FROM authored a
-            JOIN l_artist_work law2 ON law2.entity1 = a.work_id
-            JOIN link lk2           ON lk2.id = law2.link
-            JOIN lt_auth lt2        ON lt2.id = lk2.link_type
-            JOIN artist ar          ON ar.id = law2.entity0
-            GROUP BY a.work_id
+            FROM role_sets rs
+            JOIN artist ar ON ar.id = rs.artist_id
+            GROUP BY rs.work_id
         )
+
         SELECT
-            a.artist_mbid,             -- included to partition the stream; drop if not needed
-            a.artist_name,
-            a.work_name AS song_title,
+            w.work_name AS song_title,
             d.release_date_year,
             d.release_date_month,
             d.release_date_day,
             co.contributors
-        FROM authored a
-        LEFT JOIN work_first_date d ON d.work_id = a.work_id AND d.rn = 1
-        LEFT JOIN work_contrib   co ON co.work_id = a.work_id
+        FROM authored_works w
+        LEFT JOIN work_first_date d ON d.work_id = w.work_id AND d.rn = 1
+        LEFT JOIN work_contrib   co ON co.work_id = w.work_id
         """
-        return sql_text, params
-
-    with _connect() as conn:
-        # scope memory bump to this txn
-        if set_work_mem:
-            with conn.cursor() as cset:
-                cset.execute(sql.SQL("SET LOCAL work_mem TO {}").format(sql.Literal(set_work_mem)))
-
-        if path == "unnest":
-            query, params = _make_sql(use_temp_table=False)
-        else:
-            # TEMP TABLE path for huge lists
-            with conn.cursor() as cprep:
-                cprep.execute("CREATE TEMP TABLE tmp_artist_gid (gid uuid PRIMARY KEY) ON COMMIT DROP")
-                with cprep.copy("COPY tmp_artist_gid (gid) FROM STDIN WITH (FORMAT text)") as cp:
-                    cp.write("\n".join(cohort) + "\n")
-                cprep.execute("ANALYZE tmp_artist_gid")
-            query, params = _make_sql(use_temp_table=True)
 
         # Server-side cursor for streaming
-        with conn.cursor(name="mbz_song_stream", row_factory=dict_row) as cur:
+        with conn.cursor(name="mbz_song_stream_fast", row_factory=dict_row) as cur:
             cur.itersize = itersize
-            cur.execute(query, params)
+            if use_temp:
+                # two %s placeholders in the query, both for role_ids
+                cur.execute(sql_text, (role_ids, role_ids))
+            else:
+                # three placeholders: cohort (uuid[]), role_ids, role_ids
+                cur.execute(sql_text, (cohort, role_ids, role_ids))
             for row in cur:
-                # If you want an ISO field in the stream, uncomment:
-                # row["release_date_iso"] = _iso_from_ymd(
-                #     row.get("release_date_year"),
-                #     row.get("release_date_month"),
-                #     row.get("release_date_day"),
-                # )
-                yield {
-                    # If you truly don't want artist identity in each row, remove the next two fields.
-                    "artist_mbid": row["artist_mbid"],
-                    "artist_name": row["artist_name"],
-                    "song_title": row["song_title"],
-                    "release_date_year": row["release_date_year"],
-                    "release_date_month": row["release_date_month"],
-                    "release_date_day": row["release_date_day"],
-                    "contributors": row["contributors"],
-                }
+                _map_roles_inplace(row.get("contributors"), role_id_to_name)
+                yield row
 
 if __name__ == "__main__":
     import json
