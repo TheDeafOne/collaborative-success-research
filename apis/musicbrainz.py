@@ -15,8 +15,9 @@ Env var overrides:
 Requires:
   pip install "psycopg[binary]"
 """
-
 from __future__ import annotations
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
 
 import os
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -164,6 +165,7 @@ def _map_roles_inplace(contributors: List[Dict[str, Any]], role_id_to_name: Dict
         ids = c.pop("role_ids", []) or []
         c["roles"] = [role_id_to_name.get(rid, str(rid)) for rid in ids]
 
+
 def stream_artists_songs_by_mbids(
     artist_mbids: Sequence[str],
     *,
@@ -179,8 +181,6 @@ def stream_artists_songs_by_mbids(
         "works": [
           {
             "song_title": <str>,
-            "release_date_year": <int|None>,
-            "release_month": <int|None>,
             "contributor_mbids": <List[UUID]>   # all authors for that work
           }, ...
         ]
@@ -192,13 +192,10 @@ def stream_artists_songs_by_mbids(
     # Validate & dedupe while preserving order
     seen, cohort = set(), []
     for mbid in artist_mbids:
-        try:
-            UUID(mbid)
-            if mbid not in seen:
-                seen.add(mbid)
-                cohort.append(mbid)
-        except:
-            print(f'error reading in {mbid}')
+        UUID(mbid)
+        if mbid not in seen:
+            seen.add(mbid)
+            cohort.append(mbid)
 
     AUTHOR_ROLE_NAMES = ("composer", "lyricist", "writer", "librettist")
 
@@ -211,7 +208,7 @@ def stream_artists_songs_by_mbids(
                 cset.execute("SET LOCAL jit = off")
             cset.execute("SET LOCAL synchronous_commit = off")
 
-        # Resolve link_type IDs once; we’ll filter by ID to avoid the join at runtime
+        # Resolve link_type IDs once; filter by ID to avoid joining link_type later
         with conn.cursor() as c_lt:
             c_lt.execute("SELECT id FROM link_type WHERE name = ANY(%s)", (list(AUTHOR_ROLE_NAMES),))
             role_ids = [r[0] for r in c_lt.fetchall()]
@@ -265,27 +262,7 @@ def stream_artists_songs_by_mbids(
             c1.execute("CREATE INDEX ON tmp_artist_authored_works (work_id)")
             c1.execute("ANALYZE tmp_artist_authored_works")
 
-        # 2) Earliest known release date per work (MIN over synthetic date)
-        with conn.cursor() as c2:
-            c2.execute("""
-                CREATE TEMP TABLE tmp_work_first_date AS
-                SELECT w.work_id,
-                       EXTRACT(YEAR  FROM MIN(make_date(rfrd.year,
-                                                        COALESCE(rfrd.month, 12),
-                                                        COALESCE(rfrd.day, 31))))::int AS release_date_year,
-                       EXTRACT(MONTH FROM MIN(make_date(rfrd.year,
-                                                        COALESCE(rfrd.month, 12),
-                                                        COALESCE(rfrd.day, 31))))::int AS release_month
-                FROM tmp_artist_authored_works w
-                JOIN l_recording_work lrw ON lrw.entity1 = w.work_id
-                JOIN recording_first_release_date rfrd ON rfrd.recording = lrw.entity0
-                WHERE rfrd.year IS NOT NULL
-                GROUP BY w.work_id
-            """)
-            c2.execute("CREATE INDEX ON tmp_work_first_date (work_id)")
-            c2.execute("ANALYZE tmp_work_first_date")
-
-        # 3) Contributor MBIDs per work (all authors)
+        # 2) Contributor MBIDs per work (all authors)
         with conn.cursor() as c3:
             c3.execute("""
                 CREATE TEMP TABLE tmp_work_contrib_mbids AS
@@ -301,17 +278,14 @@ def stream_artists_songs_by_mbids(
             c3.execute("CREATE INDEX ON tmp_work_contrib_mbids (work_id)")
             c3.execute("ANALYZE tmp_work_contrib_mbids")
 
-        # 4) Stream rows ordered by artist_id so we can yield per-artist blocks
+        # 3) Stream rows ordered by artist_id so we can yield per-artist blocks
         sql_stream = """
             SELECT
                 a.artist_mbid,
                 a.work_name AS song_title,
-                d.release_date_year,
-                d.release_month,
                 co.contributor_mbids
             FROM tmp_artist_authored_works a
-            LEFT JOIN tmp_work_first_date      d  ON d.work_id = a.work_id
-            LEFT JOIN tmp_work_contrib_mbids   co ON co.work_id = a.work_id
+            LEFT JOIN tmp_work_contrib_mbids co ON co.work_id = a.work_id
             ORDER BY a.artist_id, a.work_name
         """
 
@@ -334,14 +308,86 @@ def stream_artists_songs_by_mbids(
 
                 bucket.append({
                     "song_title": row["song_title"],
-                    "release_date_year": row["release_date_year"],
-                    "release_month": row["release_month"],
                     "contributor_mbids": row["contributor_mbids"] or [],
                 })
 
             # flush last
             if current_artist is not None:
                 yield {"artist_mbid": current_artist, "works": bucket}
+
+def _chunked(seq: Sequence[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+# --- worker executed in each process/thread ---
+def _worker_stream_chunk(chunk: List[str], stream_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Import here if your function lives elsewhere, e.g.:
+    # from apis.musicbrainz import stream_artists_songs_by_mbids
+    return list(stream_artists_songs_by_mbids(chunk, **stream_kwargs))
+
+def parallel_stream_artists_songs_by_mbids(
+    artist_mbids: Sequence[str],
+    *,
+    # parallelism
+    mode: str = "process",                 # "process" (best) or "thread" (lighter)
+    max_workers: int | None = None,        # default: min(8, cpu_count)
+    chunk_size: int = 1000,                # tune based on avg works/artist
+    ordered: bool = False,                 # True = preserve input order
+    # kwargs forwarded to your single-node function
+    itersize: int = 100_000,
+    path: str = "temp_table",
+    set_work_mem: str | None = "512MB",
+    disable_jit: bool = True,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Parallel wrapper around `stream_artists_songs_by_mbids`.
+
+    Yields the same per-artist objects your function produces:
+      {"artist_mbid": <UUID>, "works": [ {"song_title": str, "contributor_mbids": [UUID, ...]}, ... ]}
+    """
+    if not artist_mbids:
+        return
+
+    # dedupe while preserving order (cheap)
+    seen, cohort = set(), []
+    for x in artist_mbids:
+        if x not in seen:
+            seen.add(x)
+            cohort.append(x)
+
+    # choose executor
+    if max_workers is None:
+        max_workers = min(8, os.cpu_count() or 4)
+    Executor = ProcessPoolExecutor if mode == "process" else ThreadPoolExecutor
+
+    # kwargs forwarded to the inner streaming call
+    stream_kwargs = dict(itersize=itersize, path=path, set_work_mem=set_work_mem, disable_jit=disable_jit)
+
+    # shard input
+    shards = [(i, chunk) for i, chunk in enumerate(_chunked(cohort, chunk_size)) if chunk]
+
+    with Executor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_worker_stream_chunk, chunk, stream_kwargs): idx
+            for idx, chunk in shards
+        }
+
+        if not ordered:
+            # fastest: emit as soon as a shard finishes
+            for fut in as_completed(futures):
+                for item in fut.result():
+                    yield item
+        else:
+            # preserve original order of shards
+            next_idx = 0
+            buffer: dict[int, List[Dict[str, Any]]] = {}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                buffer[idx] = fut.result()
+                while next_idx in buffer:
+                    for item in buffer.pop(next_idx):
+                        yield item
+                    next_idx += 1
 
 if __name__ == "__main__":
     import json
