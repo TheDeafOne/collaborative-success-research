@@ -109,4 +109,4 @@ if __name__ == "__main__":
     with open('./data/artist_mbids.txt', 'r') as f:
         artist_mbids = f.read().splitlines()
     
-    dump_artists_works_jsonl(artist_mbids[:2000], './data/artist_collab_data', mb.stream_artists_songs_by_mbids_fast)
+    dump_artists_works_jsonl(artist_mbids, './data/artist_collab_data', mb.stream_artists_songs_by_mbids_fast)

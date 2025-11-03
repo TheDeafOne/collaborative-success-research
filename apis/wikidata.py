@@ -291,4 +291,23 @@ def get_artist_family_musicians(mbid: str, language: str = "en") -> List[Dict[st
     return list(rels.values())
 
 if __name__ == "__main__":
-    print(get_artist_family_musicians('c8b03190-306c-4120-bb0b-6f2ebfc06ea9'))
+    input_file = "data/artist_collab_data/filtered_artists.jsonl"
+    output_file = "data/artist_collab_data/filtered_artists_with_wikidata.jsonl"
+
+    with open(input_file, "r", encoding="utf-8") as fin, open(output_file, "w", encoding="utf-8") as fout:
+        for i, line in enumerate(fin):
+            try:
+                if not line.strip():
+                    continue  # skip blank lines
+                record = json.loads(line)
+
+                mbid = record['artist_mbid']
+                data = get_artist_family_musicians(mbid)
+                
+                if data:
+                    fout.write(json.dumps({"mbid":mbid, "relatives":data}) + "\n")
+                
+                if i % 1000 == 0:
+                    print(f'at line {i}')
+            except Exception as e:
+                print(f'line: {line}\nerror: {e}')
