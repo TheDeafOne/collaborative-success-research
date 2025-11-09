@@ -363,6 +363,7 @@ def stream_artists_songs_by_mbids(
         # Build the SQL parts conditionally
         role_ids_cte = "WITH role_ids AS (SELECT id, name FROM link_type WHERE name = ANY (%%s::text[]))"
 
+
         aliases_cte = """
         ,aliases AS (
           SELECT aa.artist, array_agg(DISTINCT aa.name ORDER BY aa.name) AS alias_names
