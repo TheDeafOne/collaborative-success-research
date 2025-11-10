@@ -125,572 +125,280 @@ def ensure_work_contrib_mv() -> None:
         conn.commit()
 
 
-def get_artist_songs_by_mbid(
-    artist_mbid: str,
+
+def stream_artists_songs_by_mbids(
+    artist_mbids,
     *,
-    unique_recordings: bool = True,  # kept for signature compatibility (ignored)
-    limit: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """
-    FAST: Return songs (works) the artist CREATED, with earliest known release date
-    and contributors.
-
-    Returns rows with keys:
-      - song_title
-      - release_date_year, release_date_month, release_date_day
-      - contributors: List[{"artist_mbid": str, "artist_name": str, "roles": [str, ...]}]
-
-    Notes:
-      - "Created" = artist has an authorship relationship to the Work:
-        composer / lyricist / writer / librettist.
-      - Earliest date is computed from any recording linked to the work using
-        recording_first_release_date (materialized view).
-      - Does NOT traverse track/medium/release; much faster.
-    """
-    UUID(artist_mbid)
-
-    # The authorship roles we consider as "created"
-    # If you want to widen/narrow later, edit this tuple.
-    author_roles = ("composer", "lyricist", "writer", "librettist")
-
-    sql = f"""
-    WITH lt_auth AS (
-        SELECT id, name
-        FROM link_type
-        WHERE name = ANY (%s)
-    ),
-    -- Works the requested artist authored (any of the roles above)
-    authored_works AS (
-        SELECT DISTINCT w.id AS work_id, w.name AS work_name
-        FROM artist a
-        JOIN l_artist_work law      ON law.entity0 = a.id
-        JOIN link lk                ON lk.id = law.link
-        JOIN lt_auth lt             ON lt.id = lk.link_type
-        JOIN work w                 ON w.id = law.entity1
-        WHERE a.gid = %s
-    ),
-    -- Earliest known release-event date for ANY recording of each work.
-    -- Use ROW_NUMBER over ordered dates and keep rn = 1 (fast, index-friendly).
-    work_earliest_date AS (
-        SELECT
-            w.work_id,
-            rfrd.year  AS release_date_year,
-            rfrd.month AS release_date_month,
-            rfrd.day   AS release_date_day,
-            ROW_NUMBER() OVER (
-                PARTITION BY w.work_id
-            ) AS rn
-        FROM authored_works w
-        JOIN l_recording_work lrw ON lrw.entity1 = w.work_id   -- work -> recording
-        JOIN recording r          ON r.id = lrw.entity0
-        LEFT JOIN recording_first_release_date rfrd
-               ON rfrd.recording = r.id
-    ),
-    -- All contributors (authors) to each work, aggregated to JSON
-    work_contributors AS (
-        SELECT
-            w.work_id,
-            jsonb_agg(
-                DISTINCT jsonb_build_object(
-                    'artist_mbid', ar.gid,
-                    'artist_name', ar.name,
-                    'roles',       roles.roles
-                )
-            ) AS contributors
-        FROM authored_works w
-        JOIN l_artist_work law2 ON law2.entity1 = w.work_id
-        JOIN link lk2           ON lk2.id = law2.link
-        JOIN lt_auth lt2        ON lt2.id = lk2.link_type
-        JOIN artist ar          ON ar.id = law2.entity0
-        -- aggregate roles-per-artist for this work
-        JOIN LATERAL (
-            SELECT array_agg(DISTINCT lt3.name) AS roles
-            FROM l_artist_work law3
-            JOIN link lk3     ON lk3.id = law3.link
-            JOIN lt_auth lt3  ON lt3.id = lk3.link_type
-            WHERE law3.entity1 = w.work_id AND law3.entity0 = ar.id
-        ) roles ON TRUE
-        GROUP BY w.work_id
-    )
-    SELECT
-        w.work_name AS song_title,
-        d.release_date_year,
-        d.release_date_month,
-        d.release_date_day,
-        co.contributors
-    FROM authored_works w
-    LEFT JOIN work_earliest_date d
-           ON d.work_id = w.work_id AND d.rn = 1
-    LEFT JOIN work_contributors co
-           ON co.work_id = w.work_id
-    { "LIMIT %s" if limit is not None else "" }
-    """
-
-    params: Tuple[Any, ...]
-    if limit is None:
-        params = (list(author_roles), artist_mbid)
-    else:
-        params = (list(author_roles), artist_mbid, int(limit))
-
-    with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        rows: List[Dict[str, Any]] = cur.fetchall()
-
-    return rows
-
-def _chunked(seq: Sequence[str], n: int) -> Iterable[List[str]]:
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
-
-
-def stream_artists_songs_by_mbids_fast(
-    artist_mbids: Sequence[Any],
-    *,
-    input_path: Literal["unnest", "temp_table"] = "unnest",
-    set_work_mem: str = "2GB",
-    disable_jit: bool = False,
-    max_parallel_workers_per_gather: int = 8,
-    on_invalid: Literal["empty", "skip", "error"] = "empty",
-) -> Iterator[Dict[str, Any]]:
-    """
-    Fast path using a parallel-friendly query + LATERAL contributor lookup.
-
-    Emits one object per *input token* (invalids can be empty per policy):
-    {"artist_mbid": <uuid str>, "works": [{"song_title": str, "contributor_mbids": [uuid str, ...]}, ...]}
-    """
-    # ---- helpers ----
-    def _coerce_uuid_str_or_none(value: Any) -> Optional[str]:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return None
-        s = str(value).strip()
-        if not s:
-            return None
+    include_aliases: bool = False,
+    include_country: bool = True,
+    include_region_city: bool = True,
+    include_perf_roles: bool = True,       # toggles l_artist_recording path in roles only
+    include_genres: bool = True,           # needs work_genre/genre or work_tag/tag
+    include_collaborators: bool = True,     # needs work_contrib_roles MV
+    input_path: str = "temp_table",
+    work_mem: str = "2GB",
+    disable_jit: bool = True,
+    itersize: int = 100_000,
+):
+    # ---- normalize inputs (same as before) ----
+    raw = list(artist_mbids or [])
+    if not raw: return
+    def _coerce_uuid(s):
+        from uuid import UUID
         try:
-            return str(UUID(s))
+            s = str(s).strip()
+            return str(UUID(s)) if s else None
         except Exception:
             return None
-
-    def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
+    def _dedupe(xs):
         seen, out = set(), []
-        for x in items:
+        for x in xs:
             if x not in seen:
                 seen.add(x); out.append(x)
         return out
+    valid = [u for u in (_coerce_uuid(x) for x in raw) if u]
+    cohort = _dedupe(valid)
+    if not cohort: return
 
-    # ---- normalize inputs ----
-    if not artist_mbids:
-        return
+    from psycopg import sql
+    from psycopg.rows import dict_row
 
-    valid_canonical: List[str] = []
-    invalid_originals: List[str] = []
-    for tok in artist_mbids:
-        coerced = _coerce_uuid_str_or_none(tok)
-        (valid_canonical if coerced is not None else invalid_originals).append(coerced or str(tok))
-
-    cohort = _dedupe_preserve_order(valid_canonical)
-    invalid_originals = _dedupe_preserve_order(invalid_originals)
-
-    if invalid_originals and on_invalid == "error":
-        raise ValueError(f"{len(invalid_originals)} invalid MBIDs; examples: {invalid_originals[:5]}")
-
-    if not cohort:
-        if on_invalid == "empty":
-            for bad in invalid_originals:
-                yield {"artist_mbid": bad, "works": []}
-        return
-
-    AUTHOR_ROLE_NAMES = ("composer", "lyricist", "writer", "librettist")
-
-    # Build the artist set (ta) via UNNEST or a temp table
     with _connect() as conn:
-        with conn.cursor() as cur:
-            # session knobs (measure each in your env)
-            if set_work_mem:
-                cur.execute(sql.SQL("SET LOCAL work_mem = {}").format(sql.Literal(set_work_mem)))
-            cur.execute(sql.SQL("SET LOCAL jit = {}").format(sql.SQL("off" if disable_jit else "on")))
-            cur.execute("SET LOCAL synchronous_commit = off")
-            if max_parallel_workers_per_gather:
-                cur.execute(
-                    sql.SQL("SET LOCAL max_parallel_workers_per_gather = {}").format(
-                        sql.Literal(int(max_parallel_workers_per_gather))
-                    )
-                )
-                cur.execute("SET LOCAL parallel_leader_participation = on")
+        with conn.cursor() as cset:
+            if work_mem: cset.execute(sql.SQL("SET LOCAL work_mem = {}").format(sql.Literal(work_mem)))
+            if disable_jit: cset.execute("SET LOCAL jit = off")
+            cset.execute("SET LOCAL synchronous_commit = off")
+            cset.execute("SET LOCAL max_parallel_workers_per_gather = 8")
+            cset.execute("SET LOCAL parallel_leader_participation = on")
 
-            # Build ta
+        # Build inp (UNLOGGED for speed)
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS inp;")
             if input_path == "temp_table":
                 cur.execute("CREATE TEMP TABLE tmp_input_gid (gid uuid PRIMARY KEY) ON COMMIT DROP;")
-                # Use psycopg COPY for speed
                 with cur.copy("COPY tmp_input_gid (gid) FROM STDIN WITH (FORMAT text)") as cp:
                     cp.write("\n".join(cohort) + "\n")
-                cur.execute("ANALYZE tmp_input_gid;")
-                ta_src = "SELECT a.id, a.gid FROM artist a JOIN tmp_input_gid i ON i.gid = a.gid"
-                params = {"roles": list(AUTHOR_ROLE_NAMES)}
-            else:
-                ta_src = "SELECT a.id, a.gid FROM artist a JOIN unnest(%(artist_gids)s::uuid[]) x(gid) ON a.gid = x.gid"
-                params = {"roles": list(AUTHOR_ROLE_NAMES), "artist_gids": cohort}
-
-            query = f"""
-            WITH role_ids AS (
-              SELECT id FROM link_type WHERE name = ANY (%(roles)s::text[])
-            ),
-            ta AS (
-              {ta_src}
-            ),
-            rw AS (
-              -- authored
-              SELECT ta.id AS artist_id, w.id AS work_id, w.name AS work_name
-              FROM ta
-              JOIN l_artist_work law ON law.entity0 = ta.id
-              JOIN link lk ON lk.id = law.link AND lk.link_type IN (SELECT id FROM role_ids)
-              JOIN work w ON w.id = law.entity1
-
-              UNION ALL
-
-              -- performed via recording
-              SELECT ta.id, w.id, w.name
-              FROM ta
-              JOIN artist_credit_name acn ON acn.artist = ta.id
-              JOIN artist_credit ac       ON ac.id = acn.artist_credit
-              JOIN recording r            ON r.artist_credit = ac.id
-              JOIN l_recording_work lrw   ON lrw.entity0 = r.id
-              JOIN work w                 ON w.id = lrw.entity1
-            ),
-            rw_dedup AS (
-              SELECT artist_id, work_id, MIN(work_name) AS work_name
-              FROM rw
-              GROUP BY artist_id, work_id
-            )
-            SELECT
-              ta.gid AS artist_mbid,
-              COALESCE(
-                jsonb_agg(
-                  jsonb_build_object(
-                    'song_title', rw_dedup.work_name,
-                    'contributor_mbids', COALESCE(contrib.contributor_mbids, ARRAY[]::uuid[])
-                  )
-                ) FILTER (WHERE rw_dedup.work_name IS NOT NULL),
-                '[]'::jsonb
-              ) AS works
-            FROM ta
-            LEFT JOIN rw_dedup ON rw_dedup.artist_id = ta.id
-            LEFT JOIN LATERAL (
-              SELECT array_agg(DISTINCT ar.gid) AS contributor_mbids
-              FROM l_artist_work law
-              JOIN link lk ON lk.id = law.link AND lk.link_type IN (SELECT id FROM role_ids)
-              JOIN artist ar ON ar.id = law.entity0
-              WHERE law.entity1 = rw_dedup.work_id
-            ) contrib ON TRUE
-            GROUP BY ta.gid
-            """
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-
-        for artist_mbid, works_json in rows:
-            if works_json:
-                yield {"artist_mbid": str(artist_mbid), "works": works_json}
-
-
-# ---------------------------------------------
-# Core: stream artists & authored works by MBIDs
-# ---------------------------------------------
-def stream_artists_songs_by_mbids(
-    artist_mbids: Sequence[Any],
-    *,
-    itersize: int = 100_000,
-    path: str = "temp_table",           # "temp_table" or "unnest"
-    set_work_mem: Optional[str] = "512MB",
-    disable_jit: bool = True,
-    on_invalid: str = "empty",          # "empty" | "skip" | "error"
-) -> Iterator[Dict[str, Any]]:
-    """
-    Yield exactly one object per input token (after de-dup). Works now include:
-      1) authored works (composer/lyricist/writer/librettist), and
-      2) works performed by recordings where the artist is in the recording's artist credit.
-    """
-
-    # ---- small local helpers so we don't touch other files ----
-    import math
-    from uuid import UUID
-
-    def _coerce_uuid_str_or_none(value: Any) -> Optional[str]:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return None
-        s = str(value).strip()
-        if not s:
-            return None
-        try:
-            return str(UUID(s))
-        except Exception:
-            return None
-
-    def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
-        seen, out = set(), []
-        for x in items:
-            if x not in seen:
-                seen.add(x); out.append(x)
-        return out
-
-    # ---- normalize inputs ----
-    if not artist_mbids:
-        return
-
-    valid_canonical: List[str] = []
-    invalid_originals: List[str] = []
-    for tok in artist_mbids:
-        coerced = _coerce_uuid_str_or_none(tok)
-        (valid_canonical if coerced is not None else invalid_originals).append(coerced or str(tok))
-
-    cohort = _dedupe_preserve_order([x for x in valid_canonical])
-    invalid_originals = _dedupe_preserve_order(invalid_originals)
-
-    if invalid_originals and on_invalid == "error":
-        raise ValueError(f"{len(invalid_originals)} invalid MBIDs; examples: {invalid_originals[:5]}")
-
-    AUTHOR_ROLE_NAMES = ("composer", "lyricist", "writer", "librettist")
-
-    # If no valid UUIDs, just emit empties for invalids (if configured)
-    if not cohort:
-        if on_invalid == "empty":
-            for bad in invalid_originals:
-                yield {"artist_mbid": bad, "works": []}
-        return
-
-    with _connect() as conn:
-        # Session knobs
-        with conn.cursor() as cset:
-            if set_work_mem:
-                cset.execute(sql.SQL("SET LOCAL work_mem = {}").format(sql.Literal(set_work_mem)))
-            if disable_jit:
-                cset.execute("SET LOCAL jit = off")
-            cset.execute("SET LOCAL synchronous_commit = off")
-
-        # Resolve link_type ids once for author roles
-        with conn.cursor() as c_lt:
-            c_lt.execute("SELECT id FROM link_type WHERE name = ANY(%s)", (list(AUTHOR_ROLE_NAMES),))
-            role_ids = [r[0] for r in c_lt.fetchall()]
-            if not role_ids:
-                raise RuntimeError("Authorship link types not found.")
-
-        # Build tmp_artist from inputs
-        if path != "unnest":
-            with conn.cursor() as cprep:
-                cprep.execute("CREATE TEMP TABLE tmp_input_gid (gid uuid PRIMARY KEY) ON COMMIT DROP")
-                with cprep.copy("COPY tmp_input_gid (gid) FROM STDIN WITH (FORMAT text)") as cp:
-                    cp.write("\n".join(cohort) + "\n")
-                cprep.execute("ANALYZE tmp_input_gid")
-                cprep.execute("""
-                    CREATE TEMP TABLE tmp_artist AS
-                    SELECT a.id, a.gid
-                    FROM artist a
-                    JOIN tmp_input_gid i ON i.gid = a.gid
+                cur.execute("""
+                    CREATE UNLOGGED TABLE inp AS
+                    SELECT a.id, a.gid, a.name, a.area, a.begin_area
+                    FROM artist a JOIN tmp_input_gid i ON i.gid = a.gid;
                 """)
-                cprep.execute("CREATE INDEX ON tmp_artist (id)")
-                cprep.execute("ANALYZE tmp_artist")
-        else:
-            with conn.cursor() as cprep:
-                cprep.execute("""
-                    CREATE TEMP TABLE tmp_artist AS
-                    SELECT a.id, a.gid
+            else:
+                cur.execute("""
+                    CREATE UNLOGGED TABLE inp AS
+                    SELECT a.id, a.gid, a.name, a.area, a.begin_area
                     FROM artist a
-                    JOIN (SELECT * FROM unnest(%s::uuid[])) x(gid) ON a.gid = x.gid
+                    JOIN unnest(%s::uuid[]) x(gid) ON a.gid = x.gid;
                 """, (cohort,))
-                cprep.execute("CREATE INDEX ON tmp_artist (id)")
-                cprep.execute("ANALYZE tmp_artist")
+            cur.execute("CREATE INDEX ON inp (id); ANALYZE inp;")
 
-        # Track which valid MBIDs actually exist in artist (for emitting empties later)
-        with conn.cursor() as cgids:
-            cgids.execute("SELECT gid FROM tmp_artist")
-            present_in_artist = {str(r[0]) for r in cgids.fetchall()}
+        # Detect optional tables/MVs
+        def _exists(tab):
+            with conn.cursor() as c:
+                c.execute("SELECT to_regclass(%s)", (tab,))
+                return c.fetchone()[0] is not None
+        has_wfrd = _exists("work_first_release_date")
+        has_wcr  = _exists("work_contrib_roles")
+        use_work_genre = _exists("work_genre") and _exists("genre")
+        use_work_tag   = _exists("work_tag")   and _exists("tag")
 
-        # ------------------------------------------------------------------------------
-        # KEY FIX: works "related" to the artist = AUTHORED  ∪  PERFORMED-VIA-RECORDING
-        # ------------------------------------------------------------------------------
+        # Build the SQL parts conditionally
+        role_ids_cte = "WITH role_ids AS (SELECT id, name FROM link_type WHERE name = ANY (%%s::text[]))"
 
-        with conn.cursor() as c1:
-            c1.execute("""
-                CREATE TEMP TABLE tmp_artist_related_works AS
-                -- (A) Authored works
-                SELECT DISTINCT
-                    ta.id    AS artist_id,
-                    ta.gid   AS artist_mbid,
-                    w.id     AS work_id,
-                    w.name   AS work_name
-                FROM tmp_artist ta
-                JOIN l_artist_work law ON law.entity0 = ta.id
-                JOIN link lk           ON lk.id = law.link AND lk.link_type = ANY (%s::int[])
-                JOIN work w            ON w.id = law.entity1
 
-                UNION
+        aliases_cte = """
+        ,aliases AS (
+          SELECT aa.artist, array_agg(DISTINCT aa.name ORDER BY aa.name) AS alias_names
+          FROM artist_alias aa JOIN inp i ON i.id = aa.artist
+          GROUP BY aa.artist
+        )""" if include_aliases else ""
 
-                -- (B) Performed works via recordings:
-                --     ta.id is in the recording's artist credit, and that recording links to the work.
-                SELECT DISTINCT
-                    ta.id    AS artist_id,
-                    ta.gid   AS artist_mbid,
-                    w.id     AS work_id,
-                    w.name   AS work_name
-                FROM tmp_artist ta
-                JOIN artist_credit_name acn ON acn.artist = ta.id
-                JOIN artist_credit ac       ON ac.id = acn.artist_credit
-                JOIN recording r            ON r.artist_credit = ac.id
-                JOIN l_recording_work lrw   ON lrw.entity0 = r.id
-                JOIN work w                 ON w.id = lrw.entity1
-            """, (role_ids,))
-            c1.execute("CREATE INDEX ON tmp_artist_related_works (artist_id, work_id)")
-            c1.execute("CREATE INDEX ON tmp_artist_related_works (work_id)")
-            c1.execute("ANALYZE tmp_artist_related_works")
+        country_cte = """
+        ,country AS (
+          SELECT i.id AS artist_id, a1.name AS country_label
+          FROM inp i LEFT JOIN area a1 ON a1.id = i.area
+        )""" if include_country else ""
 
-        # Contributor MBIDs per work (authors only, as before)
-        with conn.cursor() as c2:
-            c2.execute("""
-                CREATE TEMP TABLE tmp_work_contrib_mbids AS
-                SELECT
-                    law.entity1 AS work_id,
-                    array_agg(DISTINCT ar.gid) AS contributor_mbids
-                FROM l_artist_work law
-                JOIN link   lk ON lk.id = law.link AND lk.link_type = ANY (%s::int[])
-                JOIN artist ar ON ar.id = law.entity0
-                JOIN tmp_artist_related_works w ON w.work_id = law.entity1
-                GROUP BY law.entity1
-            """, (role_ids,))
-            c2.execute("CREATE INDEX ON tmp_work_contrib_mbids (work_id)")
-            c2.execute("ANALYZE tmp_work_contrib_mbids")
+        rc_cte = """
+        ,region_city AS (
+          SELECT i.id AS artist_id, a_city.name AS region_city_label
+          FROM inp i LEFT JOIN area a_city ON a_city.id = i.begin_area
+        )""" if include_region_city else ""
 
-        # Stream: LEFT JOIN from tmp_artist so every present artist yields at least once
-        sql_stream = """
-            SELECT
-                ta.gid AS artist_mbid,
-                rw.work_name AS song_title,
-                co.contributor_mbids
-            FROM tmp_artist ta
-            LEFT JOIN tmp_artist_related_works rw ON rw.artist_id = ta.id
-            LEFT JOIN tmp_work_contrib_mbids   co ON co.work_id  = rw.work_id
+        # Roles: authorship always; performance optional (for the top-level "roles" string)
+        author_roles_cte = """
+        ,author_roles AS (
+          SELECT i.id AS artist_id, array_agg(DISTINCT lt.name) AS roles
+          FROM inp i
+          JOIN l_artist_work law ON law.entity0 = i.id
+          JOIN link lk ON lk.id = law.link
+          JOIN role_ids lt ON lt.id = lk.link_type
+          GROUP BY i.id
+        )"""
+        perf_roles_cte = """
+        ,perf_roles AS (
+          SELECT i.id AS artist_id, array_agg(DISTINCT COALESCE(lt2.name,'performer')) AS roles
+          FROM inp i
+          JOIN l_artist_recording lar ON lar.entity0 = i.id
+          JOIN link lk2 ON lk2.id = lar.link
+          LEFT JOIN link_type lt2 ON lt2.id = lk2.link_type
+          GROUP BY i.id
+        )""" if include_perf_roles else ""
+        artist_roles_cte = """
+        ,artist_roles AS (
+          SELECT artist_id, array_agg(DISTINCT role) AS role_list
+          FROM (
+            SELECT artist_id, unnest(roles) AS role FROM author_roles
+            %s
+          ) u
+          GROUP BY artist_id
+        )""" % (("UNION ALL SELECT artist_id, unnest(roles) FROM perf_roles" if include_perf_roles else ""))
+
+        # Works: authored ∪ performed
+        rw_cte = """
+        ,rw AS (
+          SELECT i.id AS artist_id, w.id AS work_id, w.name AS work_name
+          FROM inp i
+          JOIN l_artist_work law ON law.entity0 = i.id
+          JOIN link lk ON lk.id = law.link AND lk.link_type IN (SELECT id FROM role_ids)
+          JOIN work w ON w.id = law.entity1
+          UNION ALL
+          SELECT i.id, w.id, w.name
+          FROM inp i
+          JOIN artist_credit_name acn ON acn.artist = i.id
+          JOIN artist_credit ac ON ac.id = acn.artist_credit
+          JOIN recording r ON r.artist_credit = ac.id
+          JOIN l_recording_work lrw ON lrw.entity0 = r.id
+          JOIN work w ON w.id = lrw.entity1
+        ),
+        rw_dedup AS (
+          SELECT artist_id, work_id, MIN(work_name) AS work_name
+          FROM rw GROUP BY artist_id, work_id
+        )"""
+
+        # Genres source
+        if include_genres and use_work_genre:
+            genres_cte = """
+            ,work_genres AS (
+              SELECT d.artist_id, d.work_id, array_agg(DISTINCT g.name ORDER BY g.name) AS genres
+              FROM rw_dedup d
+              JOIN work_genre wg ON wg.work = d.work_id
+              JOIN genre g ON g.id = wg.genre
+              GROUP BY d.artist_id, d.work_id
+            )"""
+            genres_join = "LEFT JOIN work_genres wg ON wg.artist_id = d.artist_id AND wg.work_id = d.work_id"
+        elif include_genres and use_work_tag:
+            genres_cte = """
+            ,work_genres AS (
+              SELECT d.artist_id, d.work_id, array_agg(DISTINCT t.name ORDER BY t.name) AS genres
+              FROM rw_dedup d
+              JOIN work_tag wt ON wt.work = d.work_id
+              JOIN tag t ON t.id = wt.tag
+              GROUP BY d.artist_id, d.work_id
+            )"""
+            genres_join = "LEFT JOIN work_genres wg ON wg.artist_id = d.artist_id AND wg.work_id = d.work_id"
+        else:
+            genres_cte = ""
+            genres_join = ""
+
+        # First release date + collaborators via MV joins if present
+        date_join  = "LEFT JOIN work_first_release_date wfrd ON wfrd.work_id = d.work_id" if has_wfrd else ""
+        collab_join = "LEFT JOIN work_contrib_roles wcr ON wcr.work_id = d.work_id" if (include_collaborators and has_wcr) else ""
+
+        # --------- SQL returns flat rows (no jsonb_agg) ----------
+        q = f"""
+        {role_ids_cte}
+        {aliases_cte}
+        {country_cte}
+        {rc_cte}
+        {author_roles_cte}
+        {perf_roles_cte}
+        {artist_roles_cte}
+        {rw_cte}
+        {genres_cte}
+
+        SELECT
+          i.gid          AS mbid,
+          i.name         AS artist_name,
+          ar.role_list   AS roles_array,
+          %s             AS aliases_array,
+          %s             AS country_label,
+          %s             AS region_city_label,
+          d.work_id,
+          d.work_name,
+          %s             AS first_date,
+          %s             AS genres_array,
+          %s             AS collaborators_json
+        FROM inp i
+        LEFT JOIN artist_roles ar ON ar.artist_id = i.id
+        {("LEFT JOIN aliases al ON al.artist = i.id" if include_aliases else "")}
+        {("LEFT JOIN country  c ON c.artist_id = i.id" if include_country else "")}
+        {("LEFT JOIN region_city rc ON rc.artist_id = i.id" if include_region_city else "")}
+        LEFT JOIN rw_dedup d ON d.artist_id = i.id
+        {date_join}
+        {genres_join}
+        {collab_join}
+        ;
         """
 
-        with conn.cursor(name="mbz_song_stream_grouped", row_factory=dict_row) as cur:
-            cur.itersize = itersize
-            cur.execute(sql_stream)
+        # SELECT param placeholders to avoid rewriting the SQL:
+        aliases_sel   = "al.alias_names" if include_aliases else "NULL::text[]"
+        country_sel   = "c.country_label" if include_country else "NULL::text"
+        rc_sel        = "rc.region_city_label" if include_region_city else "NULL::text"
+        date_sel      = "to_char(wfrd.first_date, 'YYYY-MM-DD')" if has_wfrd else "NULL::text"
+        genres_sel    = "wg.genres" if (include_genres and (use_work_genre or use_work_tag)) else "NULL::text[]"
+        collab_sel    = "wcr.collaborators" if (include_collaborators and has_wcr) else "'[]'::jsonb"
 
-            current_artist: Optional[str] = None
-            bucket: List[Dict[str, Any]] = []
+        q = q % (aliases_sel, country_sel, rc_sel, date_sel, genres_sel, collab_sel)
+
+        params = (list(AUTHOR_ROLES),)
+
+        # Stream rows and assemble JSON in Python
+        with conn.cursor(name="mbz_turbo", row_factory=dict_row) as cur:
+            cur.itersize = itersize
+            cur.execute(q, params)
+
+            # bucket by artist
+            buckets = {}
+            def _ensure(mbid, name, roles, aliases, country, rc):
+                b = buckets.get(mbid)
+                if b is None:
+                    buckets[mbid] = b = {
+                        "mbid": mbid,
+                        "artist_name": name,
+                        "roles": ", ".join(roles or []) if roles else "",
+                        "aliases": aliases or [],
+                        "country": country,
+                        "region_city": rc,
+                        "works": []
+                    }
+                return b
 
             for row in cur:
-                artist_mbid = str(row["artist_mbid"])
-                if current_artist is None:
-                    current_artist = artist_mbid
-                if artist_mbid != current_artist:
-                    yield {"artist_mbid": current_artist, "works": bucket}
-                    current_artist = artist_mbid
-                    bucket = []
-
-                if row["song_title"] is not None:
-                    bucket.append({
-                        "song_title": row["song_title"],
-                        "contributor_mbids": row["contributor_mbids"] or [],
+                mbid = str(row["mbid"])
+                b = _ensure(
+                    mbid,
+                    row["artist_name"],
+                    row["roles_array"],
+                    row["aliases_array"],
+                    row["country_label"],
+                    row["region_city_label"],
+                )
+                if row["work_id"] is not None:
+                    b["works"].append({
+                        "id": row["work_id"],
+                        "name": row["work_name"],
+                        "release_date": row["first_date"],
+                        "genres": row["genres_array"] or [],
+                        "collaborators": list(row["collaborators_json"] or []),
                     })
 
-            if current_artist is not None:
-                yield {"artist_mbid": current_artist, "works": bucket}
-
-    # Emit empties for valid-but-missing artists (not in artist table)
-    for mbid in cohort:
-        if mbid not in present_in_artist:
-            yield {"artist_mbid": mbid, "works": []}
-
-    # Emit empties (or skip) for invalid tokens
-    if on_invalid == "empty":
-        for bad in invalid_originals:
-            yield {"artist_mbid": bad, "works": []}
-
-
-# --- worker executed in each process/thread ---
-def _worker_stream_chunk(chunk: List[Any], stream_kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Important: stream function itself now sanitizes inputs inside each worker.
-    return list(stream_artists_songs_by_mbids(chunk, **stream_kwargs))
-
-
-def parallel_stream_artists_songs_by_mbids(
-    artist_mbids: Sequence[Any],
-    *,
-    # parallelism
-    mode: str = "process",                 # "process" (best) or "thread" (lighter)
-    max_workers: int | None = None,        # default: min(8, cpu_count)
-    chunk_size: int = 1000,                # tune based on avg works/artist
-    ordered: bool = False,                 # True = preserve input order of shards
-    # kwargs forwarded to the single-node function
-    itersize: int = 100_000,
-    path: str = "temp_table",
-    set_work_mem: str | None = "512MB",
-    disable_jit: bool = True,
-    on_invalid: Literal["empty", "skip", "error"] = "empty",
-) -> Iterator[Dict[str, Any]]:
-    """
-    Parallel wrapper around `stream_artists_songs_by_mbids`.
-
-    Yields exactly one object per input token (after de-dup), with the same invalid handling policy.
-    """
-    if not artist_mbids:
-        return
-
-    # De-dup the *raw* inputs before sharding (cheap, avoids repeated work across shards).
-    # We do not validate here — workers handle validation and policy.
-    seen_raw: set[str] = set()
-    cohort_raw: List[Any] = []
-    for x in artist_mbids:
-        sx = str(x)
-        if sx not in seen_raw:
-            seen_raw.add(sx)
-            cohort_raw.append(x)
-
-    # choose executor
-    if max_workers is None:
-        max_workers = min(8, os.cpu_count() or 4)
-    Executor = ProcessPoolExecutor if mode == "process" else ThreadPoolExecutor
-
-    # kwargs forwarded to the inner streaming call
-    stream_kwargs = dict(
-        itersize=itersize,
-        path=path,
-        set_work_mem=set_work_mem,
-        disable_jit=disable_jit,
-        on_invalid=on_invalid,
-    )
-
-    # shard input
-    shards = [(i, chunk) for i, chunk in enumerate(_chunked(cohort_raw, chunk_size)) if chunk]
-
-    with Executor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(_worker_stream_chunk, chunk, stream_kwargs): idx
-            for idx, chunk in shards
-        }
-
-        if not ordered:
-            for fut in as_completed(futures):
-                for item in fut.result():
-                    yield item
-        else:
-            next_idx = 0
-            buffer: dict[int, List[Dict[str, Any]]] = {}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                buffer[idx] = fut.result()
-                while next_idx in buffer:
-                    for item in buffer.pop(next_idx):
-                        yield item
-                    next_idx += 1
-
-if __name__ == "__main__":
-    import json
-    test_mbid = 'c8b03190-306c-4120-bb0b-6f2ebfc06ea9'
-
-    start = time.time()
-    data = get_artist_songs_by_mbid(
-        test_mbid
-    )
-    end = time.time()
-    print(end - start)
-    
-    print(len(data), data[0])
+            # yield in input order
+            seen = set()
+            for mbid in cohort:
+                if mbid in buckets:
+                    seen.add(mbid); yield buckets[mbid]
+                else:
+                    yield {"mbid": mbid, "artist_name": None, "roles": "",
+                           "aliases": [], "country": None, "region_city": None, "works": []}
+                    

@@ -18,10 +18,10 @@ def dump_artists_works_jsonl(
     out_dir,
     getter,
     *,
-    mb_client=None,              # e.g. your mb module
+    gb_client=None,              # e.g. your mb module
     mb_stream_kwargs=None,       # e.g. {"set_work_mem": "1GB"}
     batch_size=1000,
-    shard_max_mb=300,
+    shard_max_mb=50,
     prefix=None,
     retries=1,
     backoff=1.5,
@@ -33,13 +33,10 @@ def dump_artists_works_jsonl(
     Example:
         dump_artists_works_jsonl(top_artists, "data/artists_works")
     """
-    if mb_client is None:
-        mb_client = globals().get("mb")
-        if mb_client is None:
-            raise RuntimeError("Provide mb_client or define a global `mb`.")
-
-    if mb_stream_kwargs is None:
-        mb_stream_kwargs = {"set_work_mem": "1GB"}
+    if gb_client is None:
+        gb_client = globals().get("gb")
+        if gb_client is None:
+            raise RuntimeError("Provide gb_client or define a global `gb`.")
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -79,7 +76,7 @@ def dump_artists_works_jsonl(
             batch = mbids[i:i + batch_size]
             for attempt in range(retries + 1):
                 try:
-                    for obj in getter(batch, on_invalid='skip', **mb_stream_kwargs):
+                    for obj in getter(batch):
                         if cur_bytes >= shard_max_bytes:
                             open_new_file()
                         write_obj(obj)
@@ -105,8 +102,8 @@ def dump_artists_works_jsonl(
     print(f"Done. {total_rows} rows written across {part} files. Errors logged to {errors_path}")
 
 if __name__ == "__main__":
-    from apis import musicbrainz as mb
-    with open('./data/artist_mbids.txt', 'r') as f:
+    from experiments import graph_builder as gb
+    with open('./data/all_artist_mbids.txt', 'r') as f:
         artist_mbids = f.read().splitlines()
     
-    dump_artists_works_jsonl(artist_mbids, './data/artist_collab_data', mb.stream_artists_songs_by_mbids_fast)
+    dump_artists_works_jsonl(artist_mbids, './data/artist_collab_data', gb.stream_artists_songs_by_mbids)

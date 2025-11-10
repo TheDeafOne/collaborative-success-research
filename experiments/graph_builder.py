@@ -288,13 +288,13 @@ def stream_artists_songs_by_mbids(
     artist_mbids,
     *,
     include_aliases: bool = False,
-    include_country: bool = False,
-    include_region_city: bool = False,
-    include_perf_roles: bool = False,       # toggles l_artist_recording path in roles only
-    include_genres: bool = False,           # needs work_genre/genre or work_tag/tag
+    include_country: bool = True,
+    include_region_city: bool = True,
+    include_perf_roles: bool = True,       # toggles l_artist_recording path in roles only
+    include_genres: bool = True,           # needs work_genre/genre or work_tag/tag
     include_collaborators: bool = True,     # needs work_contrib_roles MV
     input_path: str = "temp_table",
-    work_mem: str = "512MB",
+    work_mem: str = "2GB",
     disable_jit: bool = True,
     itersize: int = 100_000,
 ):
@@ -559,3 +559,4 @@ def stream_artists_songs_by_mbids(
                 else:
                     yield {"mbid": mbid, "artist_name": None, "roles": "",
                            "aliases": [], "country": None, "region_city": None, "works": []}
+                    
