@@ -17,19 +17,17 @@ Requires:
 """
 
 from __future__ import annotations
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-
+import math
 import os
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from uuid import UUID
 
 import psycopg
-from psycopg.rows import dict_row
 from psycopg import sql
-import time
-
-import math
+from psycopg.rows import dict_row
 
 
 def _connect() -> psycopg.Connection:
@@ -473,158 +471,3 @@ def stream_artists_songs_by_mbids(
                         "region_city": None,
                         "works": [],
                     }
-
-
-def get_artist_resources(artist_mbid, work_mem=None):
-    """
-    Given an artist MBID, return all associated external resource URLs.
-
-    Args:
-        artist_mbid (str): MusicBrainz Identifier (UUID) of the artist.
-        work_mem (str | None): Optional PostgreSQL work_mem setting (e.g., '64MB').
-
-    Returns:
-        list[dict]: Each dict contains {'url': str, 'link_type': str, 'begin_date': str, 'end_date': str}.
-    """
-    query = sql.SQL("""
-        SELECT
-            u.id AS url_id,
-            u.url AS url,
-            lt.name AS link_type,
-            l.begin_date_year,
-            l.end_date_year
-        FROM artist a
-        JOIN l_artist_url lau ON lau.entity0 = a.id
-        JOIN link l ON l.id = lau.link
-        JOIN link_type lt ON lt.id = l.link_type
-        JOIN url u ON u.id = lau.entity1
-        WHERE a.gid = {artist_mbid}
-        ORDER BY lt.name;
-    """).format(artist_mbid=sql.Literal(artist_mbid))
-
-    with _connect() as conn:
-        with conn.cursor() as cset:
-            # Optional work_mem tuning
-            if work_mem:
-                cset.execute(
-                    sql.SQL("SET LOCAL work_mem = {}").format(sql.Literal(work_mem))
-                )
-
-            cset.execute(query)
-            rows = cset.fetchall()
-
-    return [
-        {
-            "url": row[1],
-            "link_type": row[2],
-            "begin_date": row[3],
-            "end_date": row[4],
-        }
-        for row in rows
-    ]
-
-
-def _batched(iterable: Iterable[str], n: int) -> Iterator[List[str]]:
-    """Yield lists of size <= n from an iterable without loading all items."""
-    batch = []
-    for item in iterable:
-        batch.append(item)
-        if len(batch) >= n:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-_PLATFORM_SUBSTRINGS = [
-    # YouTube & YouTube Music
-    "youtube.com",
-    "youtu.be",
-    "music.youtube.com",
-    # SoundCloud
-    "soundcloud.com",
-    # Spotify
-    "open.spotify.com",
-    "spotify.com",
-    # Last.fm
-    "last.fm",
-    # Twitter / X
-    "twitter.com",
-    "x.com",
-    # Instagram (user list had 'instagramr' — assuming Instagram)
-    "instagram.com",
-]
-
-
-def stream_artist_resources(
-    mbids: Iterable[str],
-    work_mem: str | None = None,
-    batch_size: int = 10_000,
-) -> Iterator[Tuple[str, List[Dict[str, str]]]]:
-    """
-    Stream (artist_mbid, resources[]) for artists having URLs matching selected platforms.
-    Skips artists with no matching resources.
-
-    resources[] = [{ 'url': str, 'link_type': str }]
-
-    Notes:
-    - psycopg3-safe: no % wildcards in the SQL text; all patterns are parameters.
-    - Uses a server-side cursor to avoid loading all rows into memory.
-    - Uses a.gid = ANY(%s) to pass batched MBIDs.
-    """
-
-    # Build OR’ed ILIKE clauses as placeholders (u.url ILIKE %s OR ...)
-    like_clause = " OR ".join(["u.url ILIKE %s"] * len(_PLATFORM_SUBSTRINGS))
-
-    # Plain string is fine with psycopg3; we only pass parameters via %s
-    query = f"""
-        SELECT
-            a.gid AS artist_mbid,
-            lt.name AS link_type,
-            u.url AS url
-        FROM artist a
-        JOIN l_artist_url lau ON lau.entity0 = a.id
-        JOIN link l ON l.id = lau.link
-        JOIN link_type lt ON lt.id = l.link_type
-        JOIN url u ON u.id = lau.entity1
-        WHERE a.gid = ANY(%s)
-          AND ({like_clause})
-        ORDER BY a.gid;
-    """
-
-    # Precompute the LIKE parameter list once (e.g., '%spotify%')
-    like_params = [f"%{s}%" for s in _PLATFORM_SUBSTRINGS]
-
-    with _connect() as conn:
-        # SET LOCAL applies within the current transaction
-        if work_mem:
-            with conn.cursor() as c:
-                c.execute("SET LOCAL work_mem = %s", (work_mem,))
-
-        for batch in _batched(mbids, batch_size):
-            # Server-side (named) cursor for streaming rows
-            with conn.cursor(name="artist_resource_stream") as cur:
-                # Parameters: first the array of mbids, then the like patterns
-                cur.execute(query, (batch, *like_params))
-
-                current_artist = None
-                current_resources: List[Dict[str, str]] = []
-
-                for artist_mbid, link_type, url in cur:
-                    if artist_mbid != current_artist:
-                        # emit previous artist if present
-                        if current_artist is not None and current_resources:
-                            yield current_artist, current_resources
-                        current_artist = artist_mbid
-                        current_resources = []
-
-                    current_resources.append(
-                        {
-                            "link_type": link_type,
-                            "url": url,
-                        }
-                    )
-
-                # emit the final artist from this batch
-                if current_artist is not None and current_resources:
-                    yield current_artist, current_resources
