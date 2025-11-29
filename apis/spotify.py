@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from ast import List
 import base64
 import datetime as dt
 import json
@@ -185,11 +186,12 @@ def get_artist_albums(
     albums: list[dict] = []
     url = f"{API}/artists/{artist_id}/albums"
     params = {
-        "market": market,
         "include_groups": include_groups,
         "limit": limit,
         "offset": 0,
     }
+    if market is not None:
+        params.update({'market': market})
 
     while True:
         print(url, params)
@@ -239,7 +241,10 @@ def get_album_tracks(
     tracks, limit, offset = [], 50, 0
     url = f"{API}/albums/{album_id}/tracks"
     while True:
-        page = _get(url, {"market": market, "limit": limit, "offset": offset})
+        params = {"limit": limit, "offset": offset}
+        if market is not None:
+            params.update({'market': market})
+        page = _get(url, params)
         items = page.get("items", []) or []
         tracks.extend(items)
         if len(items) < limit:
@@ -700,3 +705,225 @@ def get_artist_popularity_by_year(
             }
         )
     return out
+
+
+
+
+def get_spotify_artist(
+    artist_id: str,
+    include_groups: str = "album,single,compilation,appears_on",
+) -> dict:
+    """
+    Build a Spotify-side artist payload structurally similar to the MusicBrainz result:
+
+        {
+            "mbid": str,                 # here: Spotify artist_id
+            "artist_name": str | None,
+            "roles": str,                # NOT AVAILABLE on Spotify; left as empty string
+            "country": str | None,       # NOT AVAILABLE on Spotify; left as None
+            "region_city": str | None,   # NOT AVAILABLE on Spotify; left as None
+            "works": [...],
+            "recordings": [...],
+            "releases": [...],
+        }
+
+    Propagation of higher-level data when granular equivalents are missing:
+
+      - Work-level genres:
+            Spotify has *artist-level* genres, but no per-work or per-track genres.
+            We therefore propagate `artist_meta["genres"]` down to each work's
+            `genres` field.
+
+      - If you later want to propagate other attributes (e.g. artist country)
+        down to works/recordings/releases, you can follow the same pattern.
+
+    Notes on missing data vs MusicBrainz:
+      - `roles`: Spotify does not expose role taxonomy (composer, arranger, etc.).
+      - `country`, `region_city`: Spotify /artists/{id} does not expose origin country
+        or city; we cannot populate these reliably from Spotify alone.
+      - `release_group_id`: Spotify has no release-group abstraction.
+      - `label_ids`: Spotify only exposes free-text label names, no stable IDs.
+      - `work_id`: Spotify has no composition/work layer; we synthesize them.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Basic artist metadata (and artist-level genres)
+    # ------------------------------------------------------------------
+    # Strictly, /artists/{id} ignores market, but passing is harmless if present.
+    artist_meta = _get(f"{API}/artists/{artist_id}", params=None) or {}
+
+    artist_name = artist_meta.get("name")
+    # Spotify gives artist-level genres as a list of strings.
+    artist_genres: List[str] = artist_meta.get("genres") or []
+
+    # Spotify has no explicit country/origin fields
+    country = None      # cannot be fetched from Spotify API
+    region_city = None  # cannot be fetched from Spotify API
+    roles = ""          # no detailed role taxonomy available
+
+    # ------------------------------------------------------------------
+    # 1. Get all albums once
+    # ------------------------------------------------------------------
+    albums = get_artist_albums(
+        artist_id,
+        market=None,
+        include_groups=include_groups,
+    )
+
+    releases: List[dict] = []
+    recordings: List[dict] = []
+
+    # For works (synthetic compositions)
+    # key: (normalized_title, frozenset(artist_ids))  -> aggregated group
+    work_groups: dict[Tuple[str, frozenset[str]], Dict[str, Any]] = {}
+
+    seen_album_ids: set[str] = set()
+    seen_track_ids: set[str] = set()
+    artist_id_str = str(artist_id)
+
+    # ------------------------------------------------------------------
+    # 2. Single pass over albums + tracks
+    # ------------------------------------------------------------------
+    for album in albums:
+        album_id = album.get("id")
+        if not album_id:
+            continue
+
+        # Compute album date for this iteration (we may need it even for
+        # already-seen album_ids when there are duplicate album entries).
+        raw_date = album.get("release_date")
+        precision = album.get("release_date_precision", "day")
+        album_date: dt.date | None = (
+            _parse_release_date(raw_date, precision) if raw_date else None
+        )
+        album_date_str: str | None = (
+            album_date.isoformat() if album_date is not None else None
+        )
+
+        # ---- Releases block (album-level) ----
+        if album_id not in seen_album_ids:
+            seen_album_ids.add(album_id)
+
+            label = (album.get("label") or "").strip()
+            label_names = [label] if label else []
+
+            releases.append(
+                {
+                    "id": album_id,          # Spotify album ID (string)
+                    "title": album.get("name"),
+                    "date": album_date_str,
+                    "release_group_id": None,  # no equivalent
+                    "label_ids": [],           # Spotify has no stable label IDs
+                    "label_names": label_names,
+                    # NOTE: if you want to propagate artist genres onto releases, you
+                    # could add "genres": artist_genres here, but your MB schema
+                    # doesn't have a genres field on releases.
+                }
+            )
+
+        # ---- Tracks for this album ----
+        tracks = get_album_tracks(album_id, market=None)
+
+        for t in tracks:
+            track_id = t.get("id")
+            if not track_id:
+                continue
+
+            # ---- Recordings block (track-level) ----
+            if track_id not in seen_track_ids:
+                seen_track_ids.add(track_id)
+
+                recordings.append(
+                    {
+                        "id": track_id,                # Spotify track ID (string)
+                        "name": t.get("name"),
+                        "length_ms": t.get("duration_ms"),
+                        "work_id": None,               # Spotify has no true work layer
+                        "release_id": album_id,        # link back to this album
+                        # If you wanted, you *could* propagate artist_genres down
+                        # to recordings via an extra field (not in your MB schema).
+                    }
+                )
+
+            # ---- Works block (synthetic compositions) ----
+            track_name = (t.get("name") or "").strip()
+            if not track_name:
+                continue
+
+            artists_meta = t.get("artists", []) or []
+            track_artist_ids = [
+                a.get("id") for a in artists_meta if a.get("id") is not None
+            ]
+            if not track_artist_ids:
+                continue
+
+            norm_title = track_name.lower()
+            key = (norm_title, frozenset(track_artist_ids))
+
+            if key not in work_groups:
+                # Initialize synthetic "work" with artist-level genres propagated down.
+                work_groups[key] = {
+                    "name": track_name,
+                    "first_release_date": album_date,
+                    # PROPAGATED: artist-level genres -> work-level genres
+                    "genres": list(artist_genres),
+                    # We accumulate collaborators as (id, name) tuples, convert later.
+                    "collaborators": set(),
+                }
+
+            group = work_groups[key]
+
+            # Update earliest known release date for this synthetic "work"
+            if album_date is not None:
+                prev = group["first_release_date"]
+                if prev is None or album_date < prev:
+                    group["first_release_date"] = album_date
+
+            # Collaborators = all credited artists except the main artist_id
+            for a_meta in artists_meta:
+                aid = a_meta.get("id")
+                if not aid or aid == artist_id_str:
+                    continue
+                aname = a_meta.get("name") or ""
+                group["collaborators"].add((aid, aname))
+
+    # ------------------------------------------------------------------
+    # 3. Finalize works with synthetic IDs
+    # ------------------------------------------------------------------
+    works: List[dict] = []
+    for idx, (key, group) in enumerate(work_groups.items()):
+        first_date = group["first_release_date"]
+        date_str = first_date.isoformat() if isinstance(first_date, dt.date) else None
+
+        collaborators_list = [
+            {"id": aid, "name": aname}
+            for (aid, aname) in sorted(group["collaborators"], key=lambda x: x[1].lower())
+        ]
+
+        works.append(
+            {
+                # Synthetic per-call integer ID. This is NOT a Spotify or MusicBrainz ID.
+                "id": idx,
+                "name": group["name"],
+                "first_release_date": date_str,
+                # These come from artist-level genres, propagated down.
+                "genres": group["genres"],
+                "collaborators": collaborators_list,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Assemble final artist dict
+    # ------------------------------------------------------------------
+    artist: dict = {
+        "mbid": artist_id,          # here: Spotify artist_id
+        "artist_name": artist_name,
+        "roles": roles,             # cannot derive detailed roles from Spotify
+        "country": country,         # Spotify does not expose origin country
+        "region_city": region_city, # Spotify does not expose city/region
+        "works": works,
+        "recordings": recordings,
+        "releases": releases,
+    }
+
+    return artist
