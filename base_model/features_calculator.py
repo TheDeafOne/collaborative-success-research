@@ -5,6 +5,8 @@ from statistics import median, pstdev
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# ---------------- generic helpers ----------------
+
 def _parse_date(s: Optional[str]) -> Optional[dt.date]:
     if not s:
         return None
@@ -46,29 +48,40 @@ def _pct(num: int, denom: int) -> Optional[float]:
 
 # ---------------- window + base extraction ----------------
 
-
 def _compute_debut_and_cutoff(
     works: List[Dict[str, Any]],
     releases: List[Dict[str, Any]],
     years: int,
-) -> Tuple[dt.date, dt.date, List[dt.date]]:
+) -> Tuple[Optional[dt.date], Optional[dt.date], List[dt.date]]:
+    """
+    Returns:
+        debut_date: earliest activity date (or None if unknown)
+        cutoff: debut_date + years (or None if debut_date is None)
+        all_dates: list of all valid activity dates (possibly empty)
+    """
     release_dates_all = [
         d for d in (_parse_date(r.get("date")) for r in releases) if d is not None
     ]
     work_dates_all = [
-        d
-        for d in (_parse_date(w.get("first_release_date")) for w in works)
-        if d is not None
+        d for d in (_parse_date(w.get("first_release_date")) for w in works) if d is not None
     ]
 
     all_dates = release_dates_all or work_dates_all
     if not all_dates:
-        raise ValueError(
-            "Cannot compute debut date: no valid dates on releases or works."
-        )
+        # No temporal information at all
+        return None, None, []
 
     debut_date = min(all_dates)
-    cutoff = debut_date.replace(year=debut_date.year + years)
+    try:
+        cutoff = debut_date.replace(year=debut_date.year + years)
+    except ValueError:
+        # Extremely rare (e.g., Feb 29 edge cases) – fall back to simple year add
+        cutoff = dt.date(debut_date.year + years, debut_date.month, min(
+            debut_date.day,
+            dt.date(debut_date.year + years, debut_date.month, 1).replace(
+                day=28
+            ).day,
+        ))
     return debut_date, cutoff, all_dates
 
 
@@ -76,17 +89,23 @@ def _filter_early_window(
     works: List[Dict[str, Any]],
     recordings: List[Dict[str, Any]],
     releases: List[Dict[str, Any]],
-    cutoff: dt.date,
+    cutoff: Optional[dt.date],
 ) -> Tuple[
     List[Dict[str, Any]],
     List[Dict[str, Any]],
     List[Dict[str, Any]],
     Dict[int, Optional[dt.date]],
 ]:
+    """
+    Filter works/recordings/releases to the early-career window defined by cutoff.
+    If cutoff is None (no debut), all window-based lists are empty.
+    """
+    if cutoff is None:
+        return [], [], [], {}
+
     # releases in window
     releases_win = [
-        r
-        for r in releases
+        r for r in releases
         if (d := _parse_date(r.get("date"))) is not None and d < cutoff
     ]
 
@@ -98,7 +117,7 @@ def _filter_early_window(
     }
 
     # recordings in window (only if we can anchor them to a release date)
-    recordings_win = []
+    recordings_win: List[Dict[str, Any]] = []
     for rec in recordings:
         rid = rec.get("release_id")
         if rid is None:
@@ -128,67 +147,36 @@ def _filter_early_window(
             work_date_by_id[w_id] = rd
 
     works_win = [
-        w
-        for w in works
+        w for w in works
         if (d := work_date_by_id.get(w["id"])) is not None and d < cutoff
     ]
 
     return releases_win, recordings_win, works_win, work_date_by_id
 
 
-def _compute_temporal_control_features(
-    debut_date: dt.date,
-    all_dates: List[dt.date],
-    now: Optional[dt.date] = None,
-    lambda_per_month: float = 0.1,
-) -> Dict[str, Any]:
-    """
-    Era / exposure controls:
-
-    - years_active: years from debut to 'now'
-    - debut_year: calendar year of debut
-    - debut_decade: decade bucket (e.g., 1990, 2000)
-    - recency_index: exp(-λ * months_since_last_release), based on the latest
-      known activity date (release or work). Higher = more recently active.
-    """
-    if now is None:
-        now = dt.date.today()
-
-    # years_active
-    days_active = max(0, (now - debut_date).days)
-    years_active = days_active / 365.25
-
-    debut_year = debut_date.year
-    debut_decade = debut_year - (debut_year % 10)
-
-    # recency_index
-    if all_dates:
-        last_date = max(all_dates)
-        days_since_last = max(0, (now - last_date).days)
-        months_since_last = days_since_last / 30.44  # rough but fine for control
-        recency_index = math.exp(-lambda_per_month * months_since_last)
-    else:
-        recency_index = None
-
-    return {
-        "years_active": years_active,
-        "debut_year": debut_year,
-        "debut_decade": debut_decade,
-        "recency_index": recency_index,
-    }
-
-
 # ---------------- cadence & timing ----------------
-
 
 def _compute_cadence_features(
     releases_win: List[Dict[str, Any]],
-    debut_date: dt.date,
-    cutoff: dt.date,
+    debut_date: Optional[dt.date],
+    cutoff: Optional[dt.date],
 ) -> Dict[str, Any]:
+    if debut_date is None or cutoff is None:
+        # No temporal info at all – return null-ish cadence
+        return {
+            "releases_total": len(releases_win),
+            "releases_per_year": None,
+            "avg_days_between_releases": None,
+            "release_velocity_releases_per_day": None,
+            "release_velocity_releases_per_year": None,
+            "gap_median_days": None,
+            "gap_std_days": None,
+            "max_dry_spell_days": None,
+            "front_loading_index": None,
+        }
+
     release_dates_win = [
-        _parse_date(r.get("date"))
-        for r in releases_win
+        _parse_date(r.get("date")) for r in releases_win
         if _parse_date(r.get("date")) is not None
     ]
     release_dates_win.sort()
@@ -245,7 +233,6 @@ def _compute_cadence_features(
 
 # ---------------- collaboration / network ----------------
 
-
 def _compute_collaboration_features(
     works_win: List[Dict[str, Any]],
     recordings_win: List[Dict[str, Any]],
@@ -280,7 +267,6 @@ def _compute_collaboration_features(
 
 # ---------------- labels ----------------
 
-
 def _compute_label_features(
     releases_win: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -302,21 +288,18 @@ def _compute_label_features(
 
         labels_by_release.append(label_for_churn)
 
-    # diversity
     label_diversity_count = len({ln for ln in label_names_all if ln})
-
-    # primary label
     lbls_nonempty = [l for l in labels_by_release if l]
+
     if lbls_nonempty:
         c = Counter(lbls_nonempty)
+        # primary_label: most frequent, break ties alphabetically
         primary_label = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
         total_lbl = sum(c.values())
         label_hhi = sum((n / total_lbl) ** 2 for n in c.values())
 
-        # churn
         churn = sum(
-            1
-            for i in range(1, len(lbls_nonempty))
+            1 for i in range(1, len(lbls_nonempty))
             if lbls_nonempty[i] != lbls_nonempty[i - 1]
         )
     else:
@@ -334,12 +317,12 @@ def _compute_label_features(
 
 # ---------------- duration & title patterns ----------------
 
-
 def _compute_duration_and_title_features(
     recordings_win: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     lengths = [
-        rec["length_ms"] for rec in recordings_win if rec.get("length_ms") is not None
+        rec["length_ms"] for rec in recordings_win
+        if rec.get("length_ms") is not None
     ]
     titles = [rec.get("name") or "" for rec in recordings_win]
 
@@ -355,7 +338,10 @@ def _compute_duration_and_title_features(
         duration_ms_min = s[0]
         duration_ms_max = s[-1]
     else:
-        duration_ms_mean = duration_ms_median = duration_ms_min = duration_ms_max = None
+        duration_ms_mean = None
+        duration_ms_median = None
+        duration_ms_min = None
+        duration_ms_max = None
 
     remix_count = sum(1 for t in titles if "remix" in t.lower())
     acoustic_count = sum(1 for t in titles if "acoustic" in t.lower())
@@ -375,7 +361,6 @@ def _compute_duration_and_title_features(
 
 # ---------------- genres ----------------
 
-
 def _compute_genre_features(
     works_win: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -386,10 +371,10 @@ def _compute_genre_features(
                 genre_counter[g] += 1
 
     if genre_counter:
-        # Sort by count desc, then alphabetically
-        primary_genre = sorted(genre_counter.items(), key=lambda kv: (-kv[1], kv[0]))[
-            0
-        ][0]
+        primary_genre = sorted(
+            genre_counter.items(),
+            key=lambda kv: (-kv[1], kv[0])
+        )[0][0]
     else:
         primary_genre = None
 
@@ -400,27 +385,65 @@ def _compute_genre_features(
     }
 
 
+# ---------------- location ----------------
+
 def _compute_location_features(
     artist: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Location features are intentionally simple and based only on the
-    metadata available on the artist object. No external geocoding.
-
-    - artist_country: raw country code / name from MusicBrainz (str | None)
-    - artist_region_city: raw region/city string (str | None)
-    """
     country = artist.get("country")
     region_city = artist.get("region_city")
 
     return {
         "artist_country": country,
         "artist_region_city": region_city,
+        "location_country_known": bool(country),
+        "location_region_city_known": bool(region_city),
+    }
+
+
+# ---------------- temporal controls (era / exposure / recency) ----------------
+
+def _compute_temporal_control_features(
+    debut_date: Optional[dt.date],
+    all_dates: List[dt.date],
+    now: Optional[dt.date] = None,
+    lambda_per_month: float = 0.1,
+) -> Dict[str, Any]:
+    if now is None:
+        now = dt.date.today()
+
+    if debut_date is None:
+        # No valid dates at all
+        return {
+            "years_active": None,
+            "debut_year": None,
+            "debut_decade": None,
+            "recency_index": None,
+        }
+
+    days_active = max(0, (now - debut_date).days)
+    years_active = days_active / 365.25
+
+    debut_year = debut_date.year
+    debut_decade = debut_year - (debut_year % 10)
+
+    if all_dates:
+        last_date = max(all_dates)
+        days_since_last = max(0, (now - last_date).days)
+        months_since_last = days_since_last / 30.44
+        recency_index = math.exp(-lambda_per_month * months_since_last)
+    else:
+        recency_index = None
+
+    return {
+        "years_active": years_active,
+        "debut_year": debut_year,
+        "debut_decade": debut_decade,
+        "recency_index": recency_index,
     }
 
 
 # ---------------- main entrypoint ----------------
-
 
 def compute_mb_artist_early_features(
     artist: Dict[str, Any],
@@ -791,7 +814,7 @@ def compute_mb_artist_early_features(
     # 1) debut + window (+ all_dates for temporal controls)
     debut_date, cutoff, all_dates = _compute_debut_and_cutoff(works, releases, years)
 
-    # 2) filter entities to window
+    # 2) filter entities to window (will be empty if cutoff is None)
     releases_win, recordings_win, works_win, _ = _filter_early_window(
         works, recordings, releases, cutoff
     )
@@ -810,8 +833,8 @@ def compute_mb_artist_early_features(
         "artist_mbid": artist.get("mbid"),
         "artist_name": artist.get("artist_name"),
         "window_years": years,
-        "debut_date": debut_date.isoformat(),
-        "window_cutoff_date": cutoff.isoformat(),
+        "debut_date": debut_date.isoformat() if debut_date is not None else None,
+        "window_cutoff_date": cutoff.isoformat() if cutoff is not None else None,
     }
 
     features.update(cadence_feats)
