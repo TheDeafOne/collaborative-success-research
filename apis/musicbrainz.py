@@ -45,70 +45,55 @@ def _connect() -> psycopg.Connection:
         user=user,
         password=password,
     )
-
-
-# ---------- one-time infra: indexes you likely want ----------
-def ensure_perf_indexes() -> None:
+def ensure_mbz_perf_objects() -> None:
     """
-    Create helpful indexes if they don't already exist. Safe to call multiple times.
-    Run this once on your MBz DB (outside hot paths).
+    One-time (or occasional) setup for performance objects used by MBz data gathering.
+
+    Safe to call multiple times. Creates:
+      - Helpful indexes for artist/work/recording/release traversal
+      - Materialized view work_contrib_mbids and its index (if it doesn't exist)
+
+    Run this outside of hot paths (e.g., as a maintenance/setup step).
     """
-    stmts = [
-        # Speed authored-work lookups in both directions
-        """
-        CREATE INDEX IF NOT EXISTS idx_l_artist_work_entity0_link_entity1
-        ON l_artist_work (entity0, link, entity1);
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_l_artist_work_entity1_link_entity0
-        ON l_artist_work (entity1, link, entity0);
-        """,
-        # Recording -> work
-        """
-        CREATE INDEX IF NOT EXISTS idx_l_recording_work_entity0_entity1
-        ON l_recording_work (entity0, entity1);
-        """,
-        # Artist credit traversals
-        """
-        CREATE INDEX IF NOT EXISTS idx_artist_credit_name_artist
-        ON artist_credit_name (artist);
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_artist_credit_name_ac
-        ON artist_credit_name (artist_credit);
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_recording_artist_credit
-        ON recording (artist_credit);
-        """,
-        # Role filter
-        """
-        CREATE INDEX IF NOT EXISTS idx_link_link_type
-        ON link (link_type);
-        """,
-    ]
 
-    with _connect() as conn, conn.cursor() as cur:
-        for s in stmts:
-            cur.execute(s)
-        conn.commit()
+    def _relkind_for(cur, relname: str) -> str | None:
+        """
+        Return relkind for an unqualified relation name in the search_path:
 
+        'r' = ordinary table
+        'm' = materialized view
+        'v' = view
+        ...
 
-def refresh_work_contrib_mv(concurrently: bool = True) -> None:
-    with _connect() as conn, conn.cursor() as cur:
+        None if not found.
+        """
         cur.execute(
-            f"REFRESH MATERIALIZED VIEW {'CONCURRENTLY' if concurrently else ''} work_contrib_mbids;"
+            """
+            SELECT c.relkind
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = %s
+            ORDER BY pg_catalog.pg_table_is_visible(c.oid) DESC
+            LIMIT 1;
+            """,
+            (relname,),
         )
-        conn.commit()
+        row = cur.fetchone()
+        return row[0] if row else None
 
+    def _safe_index(cur, relname: str, ddl: str) -> None:
+        """
+        Execute CREATE INDEX DDL only if the relation exists and is a table or materialized view.
+        Skips views and missing relations.
+        """
+        kind = _relkind_for(cur, relname)
+        if kind in ("r", "m"):  # table or materialized view
+            cur.execute(ddl)
+        else:
+            # silently skip if it's a view ('v') or doesn't exist
+            pass
 
-# ---------- one-time infra: materialized view for contributors ----------
-def ensure_work_contrib_mv() -> None:
-    """
-    Creates and (re)indexes a materialized view mapping work_id -> contributor_mbids (authors).
-    Call once after you ingest/refresh MBz. Refresh later with refresh_work_contrib_mv().
-    """
-    create_mv = """
+    create_work_contrib_mv = """
     CREATE MATERIALIZED VIEW IF NOT EXISTS work_contrib_mbids AS
     WITH role_ids AS (
       SELECT id FROM link_type WHERE name IN ('composer','lyricist','writer','librettist')
@@ -121,13 +106,193 @@ def ensure_work_contrib_mv() -> None:
     JOIN artist ar ON ar.id = law.entity0
     GROUP BY law.entity1;
     """
-    with _connect() as conn, conn.cursor() as cur:
-        cur.execute(create_mv)
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_work_contrib_mbids_work_id ON work_contrib_mbids (work_id);"
-        )
-        conn.commit()
 
+    with _connect() as conn, conn.cursor() as cur:
+        # 1) Ensure MV exists
+        cur.execute(create_work_contrib_mv)
+
+        # 2) Indexes on core MB tables
+        _safe_index(
+            cur,
+            "l_artist_work",
+            """
+            CREATE INDEX IF NOT EXISTS idx_l_artist_work_entity0_link_entity1
+            ON l_artist_work (entity0, link, entity1);
+            """,
+        )
+        _safe_index(
+            cur,
+            "l_artist_work",
+            """
+            CREATE INDEX IF NOT EXISTS idx_l_artist_work_entity1_link_entity0
+            ON l_artist_work (entity1, link, entity0);
+            """,
+        )
+
+        # Recording -> work (forward & reverse)
+        _safe_index(
+            cur,
+            "l_recording_work",
+            """
+            CREATE INDEX IF NOT EXISTS idx_l_recording_work_entity0_entity1
+            ON l_recording_work (entity0, entity1);
+            """,
+        )
+        _safe_index(
+            cur,
+            "l_recording_work",
+            """
+            CREATE INDEX IF NOT EXISTS idx_l_recording_work_entity1_entity0
+            ON l_recording_work (entity1, entity0);
+            """,
+        )
+
+        # Artist credit traversals
+        _safe_index(
+            cur,
+            "artist_credit_name",
+            """
+            CREATE INDEX IF NOT EXISTS idx_artist_credit_name_artist
+            ON artist_credit_name (artist);
+            """,
+        )
+        _safe_index(
+            cur,
+            "artist_credit_name",
+            """
+            CREATE INDEX IF NOT EXISTS idx_artist_credit_name_ac
+            ON artist_credit_name (artist_credit);
+            """,
+        )
+        _safe_index(
+            cur,
+            "recording",
+            """
+            CREATE INDEX IF NOT EXISTS idx_recording_artist_credit
+            ON recording (artist_credit);
+            """,
+        )
+
+        # Role filter
+        _safe_index(
+            cur,
+            "link",
+            """
+            CREATE INDEX IF NOT EXISTS idx_link_link_type
+            ON link (link_type);
+            """,
+        )
+
+        # Performance roles via l_artist_recording
+        _safe_index(
+            cur,
+            "l_artist_recording",
+            """
+            CREATE INDEX IF NOT EXISTS idx_l_artist_recording_entity0_link
+            ON l_artist_recording (entity0, link);
+            """,
+        )
+
+        # Optional tables: first release date & contrib roles by work
+        _safe_index(
+            cur,
+            "work_first_release_date",
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_first_release_date_work_id
+            ON work_first_release_date (work_id);
+            """,
+        )
+        _safe_index(
+            cur,
+            "work_contrib_roles",
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_contrib_roles_work_id
+            ON work_contrib_roles (work_id);
+            """,
+        )
+
+        # Release path helpers (only if they are real tables/MVs in this install)
+        _safe_index(
+            cur,
+            "release_event",
+            """
+            CREATE INDEX IF NOT EXISTS idx_release_event_release_date
+            ON release_event (release, date_year, date_month, date_day);
+            """,
+        )
+        _safe_index(
+            cur,
+            "release_label",
+            """
+            CREATE INDEX IF NOT EXISTS idx_release_label_release
+            ON release_label (release, label);
+            """,
+        )
+        _safe_index(
+            cur,
+            "track",
+            """
+            CREATE INDEX IF NOT EXISTS idx_track_recording
+            ON track (recording);
+            """,
+        )
+        _safe_index(
+            cur,
+            "track",
+            """
+            CREATE INDEX IF NOT EXISTS idx_track_medium
+            ON track (medium);
+            """,
+        )
+        _safe_index(
+            cur,
+            "medium",
+            """
+            CREATE INDEX IF NOT EXISTS idx_medium_release
+            ON medium (release);
+            """,
+        )
+
+        # Genre / tag lookups by work_id
+        _safe_index(
+            cur,
+            "work_genre",
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_genre_work
+            ON work_genre (work);
+            """,
+        )
+        _safe_index(
+            cur,
+            "work_tag",
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_tag_work
+            ON work_tag (work);
+            """,
+        )
+
+        # Ensure we can cheaply go artist.gid -> artist.id
+        _safe_index(
+            cur,
+            "artist",
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_artist_gid
+            ON artist (gid);
+            """,
+        )
+
+        # 3) MV index for work_contrib_mbids (only if MV exists, which it should now)
+        _safe_index(
+            cur,
+            "work_contrib_mbids",
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_contrib_mbids_work_id
+            ON work_contrib_mbids (work_id);
+            """,
+        )
+
+        conn.commit()
+        
 AUTHOR_ROLES = [
     # writing
     "writer",
