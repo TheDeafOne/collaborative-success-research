@@ -396,8 +396,6 @@ def _compute_location_features(
     return {
         "artist_country": country,
         "artist_region_city": region_city,
-        "location_country_known": bool(country),
-        "location_region_city_known": bool(region_city),
     }
 
 
