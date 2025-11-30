@@ -51,12 +51,12 @@ def _pct(num: int, denom: int) -> Optional[float]:
 def _compute_debut_and_cutoff(
     works: List[Dict[str, Any]],
     releases: List[Dict[str, Any]],
-    years: int,
+    years: Optional[int],
 ) -> Tuple[Optional[dt.date], Optional[dt.date], List[dt.date]]:
     """
     Returns:
         debut_date: earliest activity date (or None if unknown)
-        cutoff: debut_date + years (or None if debut_date is None)
+        cutoff: debut_date + years if years is not None, otherwise None
         all_dates: list of all valid activity dates (possibly empty)
     """
     release_dates_all = [
@@ -72,18 +72,21 @@ def _compute_debut_and_cutoff(
         return None, None, []
 
     debut_date = min(all_dates)
-    try:
-        cutoff = debut_date.replace(year=debut_date.year + years)
-    except ValueError:
-        # Extremely rare (e.g., Feb 29 edge cases) – fall back to simple year add
-        cutoff = dt.date(debut_date.year + years, debut_date.month, min(
-            debut_date.day,
-            dt.date(debut_date.year + years, debut_date.month, 1).replace(
-                day=28
-            ).day,
-        ))
-    return debut_date, cutoff, all_dates
 
+    if years is None:
+        # No fixed early-career window: aggregate over entire career
+        cutoff = None
+    else:
+        try:
+            cutoff = debut_date.replace(year=debut_date.year + years)
+        except ValueError:
+            # Feb 29 etc., fallback
+            cutoff = dt.date(debut_date.year + years, debut_date.month, min(
+                debut_date.day,
+                dt.date(debut_date.year + years, debut_date.month, 1).replace(day=28).day,
+            ))
+
+    return debut_date, cutoff, all_dates
 
 def _filter_early_window(
     works: List[Dict[str, Any]],
@@ -97,17 +100,20 @@ def _filter_early_window(
     Dict[int, Optional[dt.date]],
 ]:
     """
-    Filter works/recordings/releases to the early-career window defined by cutoff.
-    If cutoff is None (no debut), all window-based lists are empty.
+    Filter entities to the early-career window if cutoff is provided.
+    If cutoff is None (years=None), include all dated activity (no upper bound).
+    If no debut/cutoff at all, you'll usually pass cutoff=None but then also
+    have debut_date=None, in which case cadence/temporal features become None.
     """
-    if cutoff is None:
-        return [], [], [], {}
-
-    # releases in window
-    releases_win = [
-        r for r in releases
-        if (d := _parse_date(r.get("date"))) is not None and d < cutoff
-    ]
+    # releases in window or whole career (depending on cutoff)
+    releases_win: List[Dict[str, Any]] = []
+    for r in releases:
+        d = _parse_date(r.get("date"))
+        if d is None:
+            continue
+        if cutoff is not None and d >= cutoff:
+            continue
+        releases_win.append(r)
 
     # map release_id -> date
     rel_date_by_id = {
@@ -116,14 +122,14 @@ def _filter_early_window(
         if _parse_date(r.get("date")) is not None
     }
 
-    # recordings in window (only if we can anchor them to a release date)
+    # recordings: keep those linked to a dated release within optional cutoff
     recordings_win: List[Dict[str, Any]] = []
     for rec in recordings:
         rid = rec.get("release_id")
         if rid is None:
             continue
-        d = rel_date_by_id.get(rid)
-        if d is None or d >= cutoff:
+        rd = rel_date_by_id.get(rid)
+        if rd is None:
             continue
         recordings_win.append(rec)
 
@@ -146,10 +152,14 @@ def _filter_early_window(
         if existing is None or rd < existing:
             work_date_by_id[w_id] = rd
 
-    works_win = [
-        w for w in works
-        if (d := work_date_by_id.get(w["id"])) is not None and d < cutoff
-    ]
+    works_win = []
+    for w in works:
+        d = work_date_by_id.get(w["id"])
+        if d is None:
+            continue
+        if cutoff is not None and d >= cutoff:
+            continue
+        works_win.append(w)
 
     return releases_win, recordings_win, works_win, work_date_by_id
 
@@ -161,7 +171,7 @@ def _compute_cadence_features(
     debut_date: Optional[dt.date],
     cutoff: Optional[dt.date],
 ) -> Dict[str, Any]:
-    if debut_date is None or cutoff is None:
+    if debut_date is None:
         # No temporal info at all – return null-ish cadence
         return {
             "releases_total": len(releases_win),
@@ -187,7 +197,9 @@ def _compute_cadence_features(
     ]
     avg_gap_days = (sum(gaps) / len(gaps)) if gaps else None
 
-    elapsed_days = (min(cutoff, dt.date.today()) - debut_date).days
+    # For rates, if cutoff is None, just use today as upper bound
+    end_for_rate = cutoff if cutoff is not None else dt.date.today()
+    elapsed_days = max(0, (min(end_for_rate, dt.date.today()) - debut_date).days)
     releases_per_year = (
         len(release_dates_win) / (elapsed_days / 365.25) if elapsed_days > 0 else None
     )
@@ -197,10 +209,10 @@ def _compute_cadence_features(
         ys = list(range(1, len(xs) + 1))
         slope = _least_squares_slope(xs, ys)
         release_velocity_per_day = slope
-        release_velocity_per_year = slope * 365.25 if slope is not None else None
+        release_velocity_releases_per_year = slope * 365.25 if slope is not None else None
     else:
         release_velocity_per_day = None
-        release_velocity_per_year = None
+        release_velocity_releases_per_year = None
 
     if len(release_dates_win) >= 2:
         gap_median = float(median(gaps))
@@ -211,8 +223,11 @@ def _compute_cadence_features(
         gap_std = None
         max_dry = None
 
+    # front-loading index
     if release_dates_win:
-        mid = debut_date + (cutoff - debut_date) / 2
+        # If cutoff is None, define the "window" as debut -> last release
+        end_for_front = cutoff if cutoff is not None else release_dates_win[-1]
+        mid = debut_date + (end_for_front - debut_date) / 2
         first_half = sum(1 for d in release_dates_win if d < mid)
         front_loading_index = first_half / len(release_dates_win)
     else:
@@ -223,7 +238,7 @@ def _compute_cadence_features(
         "releases_per_year": releases_per_year,
         "avg_days_between_releases": avg_gap_days,
         "release_velocity_releases_per_day": release_velocity_per_day,
-        "release_velocity_releases_per_year": release_velocity_per_year,
+        "release_velocity_releases_per_year": release_velocity_releases_per_year,
         "gap_median_days": gap_median,
         "gap_std_days": gap_std,
         "max_dry_spell_days": max_dry,
@@ -266,7 +281,6 @@ def _compute_collaboration_features(
 
 
 # ---------------- labels ----------------
-
 def _compute_label_features(
     releases_win: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -288,13 +302,19 @@ def _compute_label_features(
 
         labels_by_release.append(label_for_churn)
 
+    # ---------------------
+    # Primary label + HHI
+    # ---------------------
     label_diversity_count = len({ln for ln in label_names_all if ln})
     lbls_nonempty = [l for l in labels_by_release if l]
 
     if lbls_nonempty:
         c = Counter(lbls_nonempty)
-        # primary_label: most frequent, break ties alphabetically
-        primary_label = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+        primary_label = sorted(
+            c.items(), key=lambda kv: (-kv[1], kv[0])
+        )[0][0]
+
         total_lbl = sum(c.values())
         label_hhi = sum((n / total_lbl) ** 2 for n in c.values())
 
@@ -307,11 +327,26 @@ def _compute_label_features(
         churn = 0
         label_hhi = None
 
+    # ---------------------
+    # NEW: Comma-separated list of ALL label names
+    # ---------------------
+    # Normalize: lower, strip, dedupe while preserving order
+    labels_clean = []
+    seen = set()
+    for name in label_names_all:
+        normalized = name.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            labels_clean.append(normalized)
+
+    all_labels_str = ", ".join(labels_clean) if labels_clean else ""
+
     return {
         "label_diversity_count": label_diversity_count,
         "label_churn": churn,
         "label_hhi": label_hhi,
         "primary_label": primary_label,
+        "all_labels_str": all_labels_str,     # NEW
     }
 
 
@@ -360,15 +395,17 @@ def _compute_duration_and_title_features(
 
 
 # ---------------- genres ----------------
-
 def _compute_genre_features(
     works_win: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     genre_counter = Counter()
+    genre_list_raw: List[str] = []
+
     for w in works_win:
         for g in w.get("genres") or []:
             if g:
                 genre_counter[g] += 1
+                genre_list_raw.append(g)
 
     if genre_counter:
         primary_genre = sorted(
@@ -378,11 +415,26 @@ def _compute_genre_features(
     else:
         primary_genre = None
 
+    # ---------------------
+    # NEW: comma-separated list of ALL genres
+    # ---------------------
+    genres_clean = []
+    seen = set()
+    for g in genre_list_raw:
+        normalized = g.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            genres_clean.append(normalized)
+
+    all_genres_str = ", ".join(genres_clean) if genres_clean else ""
+
     return {
         "genre_count": len(genre_counter),
         "genre_entropy": _entropy(genre_counter),
         "primary_genre": primary_genre,
+        "all_genres_str": all_genres_str,     # NEW
     }
+
 
 
 # ---------------- location ----------------
@@ -442,31 +494,48 @@ def _compute_temporal_control_features(
 
 def _compute_role_features(artist: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Compute the artist's primary_role based on the comma-separated `roles` field.
-
-    Rules:
-    - Split on commas.
-    - Strip whitespace and lowercase for normalization.
-    - Count occurrences; return the highest-frequency role.
-    - If roles missing/empty → "unknown".
-    - Ties broken alphabetically.
+    Compute:
+    - primary_role: most frequent normalized role
+    - all_roles_str: comma-separated list of unique roles for downstream use
     """
     raw = artist.get("roles") or ""
     parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
 
     if not parts:
-        return {"primary_role": "unknown"}
+        return {
+            "primary_role": "unknown",
+            "all_roles_str": "",
+        }
 
     c = Counter(parts)
-    primary_role = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    primary_role = sorted(
+        c.items(), key=lambda kv: (-kv[1], kv[0])
+    )[0][0]
 
-    return {"primary_role": primary_role}
+    # ---------------------
+    # NEW: comma-separated list of ALL roles
+    # ---------------------
+    # Make deterministic: uniqueness + alphabetical order or preserve order
+    # We'll preserve input order while deduping:
+    roles_clean = []
+    seen = set()
+    for role in parts:
+        if role not in seen:
+            seen.add(role)
+            roles_clean.append(role)
+
+    all_roles_str = ", ".join(roles_clean)
+
+    return {
+        "primary_role": primary_role,
+        "all_roles_str": all_roles_str,    # NEW
+    }
 
 # ---------------- main entrypoint ----------------
 
 def compute_mb_artist_early_features(
     artist: Dict[str, Any],
-    years: int = 3,
+    years: Optional[int] = 3,
 ) -> Dict[str, Any]:
     """
     Compute early-career, artist-level features using ONLY MusicBrainz-style data.
@@ -833,7 +902,7 @@ def compute_mb_artist_early_features(
     # 1) debut + window (+ all_dates for temporal controls)
     debut_date, cutoff, all_dates = _compute_debut_and_cutoff(works, releases, years)
 
-    # 2) filter entities to window (will be empty if cutoff is None)
+    # 2) filter entities to window (if cutoff is None, this means "no upper bound")
     releases_win, recordings_win, works_win, _ = _filter_early_window(
         works, recordings, releases, cutoff
     )
@@ -848,12 +917,11 @@ def compute_mb_artist_early_features(
     temporal_control_feats = _compute_temporal_control_features(debut_date, all_dates)
     role_feats = _compute_role_features(artist)
 
-
     # 4) assemble final feature dict
     features: Dict[str, Any] = {
         "artist_mbid": artist.get("mbid"),
         "artist_name": artist.get("artist_name"),
-        "window_years": years,
+        "window_years": years,  # None means "full-career aggregation"
         "debut_date": debut_date.isoformat() if debut_date is not None else None,
         "window_cutoff_date": cutoff.isoformat() if cutoff is not None else None,
     }
