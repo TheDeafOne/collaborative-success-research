@@ -440,6 +440,27 @@ def _compute_temporal_control_features(
         "recency_index": recency_index,
     }
 
+def _compute_role_features(artist: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute the artist's primary_role based on the comma-separated `roles` field.
+
+    Rules:
+    - Split on commas.
+    - Strip whitespace and lowercase for normalization.
+    - Count occurrences; return the highest-frequency role.
+    - If roles missing/empty → "unknown".
+    - Ties broken alphabetically.
+    """
+    raw = artist.get("roles") or ""
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+    if not parts:
+        return {"primary_role": "unknown"}
+
+    c = Counter(parts)
+    primary_role = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+    return {"primary_role": primary_role}
 
 # ---------------- main entrypoint ----------------
 
@@ -825,6 +846,8 @@ def compute_mb_artist_early_features(
     genre_feats = _compute_genre_features(works_win)
     location_feats = _compute_location_features(artist)
     temporal_control_feats = _compute_temporal_control_features(debut_date, all_dates)
+    role_feats = _compute_role_features(artist)
+
 
     # 4) assemble final feature dict
     features: Dict[str, Any] = {
@@ -842,5 +865,6 @@ def compute_mb_artist_early_features(
     features.update(genre_feats)
     features.update(location_feats)
     features.update(temporal_control_feats)
+    features.update(role_feats)
 
     return features
