@@ -292,7 +292,7 @@ def ensure_mbz_perf_objects() -> None:
         )
 
         conn.commit()
-        
+
 AUTHOR_ROLES = [
     # writing
     "writer",
@@ -329,7 +329,7 @@ def stream_artists_songs_by_mbids(
     include_genres: bool = True,      # needs work_genre/genre or work_tag/tag
     include_collaborators: bool = True,  # needs work_contrib_roles MV
     input_path: str = "temp_table",
-    work_mem: str = "2GB",
+    work_mem: str = "512MB",
     disable_jit: bool = True,
     itersize: int = 10_000,
 ):
@@ -684,8 +684,8 @@ def stream_artists_songs_by_mbids(
                     """
                     CREATE UNLOGGED TABLE work_collab AS
                     SELECT w.artist_id,
-                           wcr.work_id,
-                           wcr.collaborators
+                        wcr.work_id,
+                        wcr.collaborators::json AS collaborators
                     FROM workset w
                     JOIN work_contrib_roles wcr ON wcr.work_id = w.work_id;
                     """
@@ -696,7 +696,7 @@ def stream_artists_songs_by_mbids(
             with conn.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS work_collab;")
                 cur.execute(
-                    "CREATE UNLOGGED TABLE work_collab (artist_id int, work_id int, collaborators jsonb);"
+                    "CREATE UNLOGGED TABLE work_collab (artist_id int, work_id int, collaborators json);"
                 )
 
         # -------------------------------------------------------------
@@ -708,20 +708,20 @@ def stream_artists_songs_by_mbids(
                 """
                 CREATE UNLOGGED TABLE artist_works AS
                 SELECT
-                  w.artist_id,
-                  jsonb_agg(
-                    jsonb_build_object(
-                      'id', w.work_id,
-                      'name', w.work_name,
-                      'first_release_date',
+                w.artist_id,
+                json_agg(
+                    json_build_object(
+                    'id', w.work_id,
+                    'name', w.work_name,
+                    'first_release_date',
                         CASE
-                          WHEN d.first_date IS NULL THEN NULL
-                          ELSE to_char(d.first_date, 'YYYY-MM-DD')
+                        WHEN d.first_date IS NULL THEN NULL
+                        ELSE to_char(d.first_date, 'YYYY-MM-DD')
                         END,
-                      'genres', COALESCE(g.genres, ARRAY[]::text[]),
-                      'collaborators', COALESCE(c.collaborators, '[]'::jsonb)
+                    'genres', COALESCE(g.genres, ARRAY[]::text[]),
+                    'collaborators', COALESCE(c.collaborators, '[]'::json)
                     )
-                  ) AS works
+                ) AS works
                 FROM workset w
                 LEFT JOIN work_dates   d ON d.artist_id = w.artist_id AND d.work_id = w.work_id
                 LEFT JOIN work_genres  g ON g.artist_id = w.artist_id AND g.work_id = w.work_id
@@ -789,19 +789,29 @@ def stream_artists_songs_by_mbids(
             cur.execute(
                 """
                 CREATE UNLOGGED TABLE artist_recordings AS
-                SELECT
-                  artist_id,
-                  jsonb_agg(
-                    DISTINCT jsonb_build_object(
-                      'id', rec_id,
-                      'name', rec_name,
-                      'length_ms', rec_length,
-                      'work_id', work_id,
-                      'release_id', rel_id
-                    )
-                  ) AS recordings
+                WITH distinct_recs AS (
+                SELECT DISTINCT
+                    artist_id,
+                    rec_id,
+                    rec_name,
+                    rec_length,
+                    work_id,
+                    rel_id
                 FROM work_rec_rel_raw
                 WHERE rec_id IS NOT NULL
+                )
+                SELECT
+                artist_id,
+                json_agg(
+                    json_build_object(
+                    'id', rec_id,
+                    'name', rec_name,
+                    'length_ms', rec_length,
+                    'work_id', work_id,
+                    'release_id', rel_id
+                    )
+                ) AS recordings
+                FROM distinct_recs
                 GROUP BY artist_id;
                 """
             )
@@ -835,8 +845,8 @@ def stream_artists_songs_by_mbids(
                 CREATE UNLOGGED TABLE artist_releases AS
                 SELECT
                   artist_id,
-                  jsonb_agg(
-                    jsonb_build_object(
+                  json_agg(
+                    json_build_object(
                       'id', rel_id,
                       'title', rel_name,
                       'date',
@@ -867,9 +877,9 @@ def stream_artists_songs_by_mbids(
           ar.role_list AS roles_array,
           {country_sel}    AS country_label,
           {rc_sel}         AS region_city_label,
-          COALESCE(aw.works, '[]'::jsonb)        AS works_json,
-          COALESCE(arcd.recordings, '[]'::jsonb) AS recordings_json,
-          COALESCE(arls.releases, '[]'::jsonb)   AS releases_json
+          COALESCE(aw.works, '[]'::json)        AS works_json,
+          COALESCE(arcd.recordings, '[]'::json) AS recordings_json,
+          COALESCE(arls.releases, '[]'::json)   AS releases_json
         FROM inp i
         LEFT JOIN artist_roles     ar   ON ar.artist_id = i.id
         {country_join}
