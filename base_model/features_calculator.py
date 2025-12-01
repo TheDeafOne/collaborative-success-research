@@ -535,7 +535,7 @@ def _compute_role_features(artist: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_mb_artist_early_features(
     artist: Dict[str, Any],
-    years: Optional[int] = 3,
+    years: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Compute early-career, artist-level features using ONLY MusicBrainz-style data.
