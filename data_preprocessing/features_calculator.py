@@ -260,6 +260,7 @@ def _compute_collaboration_features(
         work_is_collab[w["id"]] = len(collabs) > 1
         for c in collabs:
             collaborator_keys.add(str(c))
+            
 
     collab_tracks = 0
     for rec in recordings_win:

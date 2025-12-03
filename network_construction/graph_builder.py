@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from math import exp, log
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 
@@ -30,12 +31,13 @@ def _parse_date_to_ordinal(d: Optional[str]) -> Optional[int]:
 def _to_roles(x) -> List[str]:
     """Normalize roles to a lowercased list of strings."""
     if not x:
-        return []
+        return ["unknown"]
     if isinstance(x, str):
         parts = x.split(",")
     else:
         parts = x
-    return [str(r).strip().lower() for r in parts if str(r).strip()]
+    roles = [str(r).strip().lower() for r in parts if str(r).strip()]
+    return roles if roles else ["unknown"]
 
 
 def _compute_work_release_ordinals(artist: dict) -> Dict[int, Optional[int]]:
@@ -78,6 +80,134 @@ def _compute_work_release_ordinals(artist: dict) -> Dict[int, Optional[int]]:
             work_date[wid] = None
 
     return work_date
+
+
+def _process_artist_file(
+    path: Path,
+    mbid_to_idx: Dict[str, int],
+    cutoff_ord: List[Optional[int]],
+    # cowrite_roles: set[str],
+) -> Tuple[Dict[Tuple[int, int], List[Any]], List[Optional[int]]]:
+    """
+    Worker: process one JSONL file and return:
+      - pair_stats_local: dict[(u_idx, v_idx)] -> [w_raw, w_adj, first_ord, last_ord, sum_team, joint_count]
+      - last_ord_local: per-artist last in-window ordinal
+    """
+    n_artists = len(cutoff_ord)
+    pair_stats_local: Dict[Tuple[int, int], List[Any]] = {}
+    last_ord_local: List[Optional[int]] = [None] * n_artists
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    artist = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                a_mbid = artist.get("mbid")
+                if not a_mbid:
+                    continue
+
+                a_roles = set(_to_roles(artist.get("roles")))
+                work_date_ord = _compute_work_release_ordinals(artist)
+                works = artist.get("works", []) or []
+
+                for w in works:
+                    wid = w.get("id")
+                    if wid is None:
+                        continue
+                    work_ord = work_date_ord.get(wid)
+
+                    # Collect participants and their roles
+                    participants_roles: Dict[str, set] = {}
+                    participants_roles[a_mbid] = set(a_roles)
+
+                    for c in w.get("collaborators", []) or []:
+                        cm = c.get("mbid")
+                        if not cm:
+                            continue
+                        cr = set(_to_roles(c.get("roles")))
+                        if not cr:
+                            continue
+                        if cm in participants_roles:
+                            participants_roles[cm].update(cr)
+                        else:
+                            participants_roles[cm] = cr
+
+                    if not participants_roles:
+                        continue
+
+                    # Dedup: only lexicographically smallest mbid owns this work
+                    if a_mbid != min(participants_roles.keys()):
+                        continue
+
+                    # Build team
+                    cowwriters_all_mbids: List[str] = []
+                    cowwriters_idx: List[int] = []
+
+                    for mbid, roles in participants_roles.items():
+                        # if not (roles & cowrite_roles):
+                        #     continue
+
+                        cowwriters_all_mbids.append(mbid)
+
+                        idx = mbid_to_idx.get(mbid)
+                        if idx is None:
+                            continue  # collaborator not in our node set
+
+                        cowwriters_idx.append(idx)
+
+                        # Track last in-window date per artist (local)
+                        if work_ord is not None and (
+                            last_ord_local[idx] is None or work_ord > last_ord_local[idx]
+                        ):
+                            last_ord_local[idx] = work_ord
+
+                    n_full = len(cowwriters_all_mbids)
+                    if n_full < 2:
+                        continue
+                    if len(cowwriters_idx) < 2:
+                        continue
+
+                    denom = n_full * (n_full - 1) / 2.0
+                    adj_inc = 1.0 / denom if denom > 0 else 0.0
+
+                    for i in range(len(cowwriters_idx)):
+                        ui = cowwriters_idx[i]
+                        for j in range(i + 1, len(cowwriters_idx)):
+                            vi = cowwriters_idx[j]
+                            if ui == vi:
+                                continue
+                            u_idx, v_idx = (ui, vi) if ui < vi else (vi, ui)
+                            key = (u_idx, v_idx)
+
+                            stats = pair_stats_local.get(key)
+                            if stats is None:
+                                stats = [0, 0.0, work_ord, work_ord, 0, 0]
+                                pair_stats_local[key] = stats
+
+                            # stats: [weight_raw, weight_size_adj, first_ord, last_ord, sum_team_size, joint_count]
+                            stats[0] += 1
+                            stats[1] += adj_inc
+                            if work_ord is not None and (
+                                stats[2] is None or work_ord < stats[2]
+                            ):
+                                stats[2] = work_ord
+                            if work_ord is not None and (
+                                stats[3] is None or work_ord > stats[3]
+                            ):
+                                stats[3] = work_ord
+                            stats[4] += n_full
+                            stats[5] += 1
+    except Exception:
+        # If a file blows up, ignore and return what we have.
+        pass
+
+    return pair_stats_local, last_ord_local
 
 
 def build_cowrite_graph_streaming(
@@ -150,14 +280,6 @@ def build_cowrite_graph_streaming(
         debut_ord[i] = d.date().toordinal() if pd.notna(d) else None
         cutoff_ord[i] = c.date().toordinal() if pd.notna(c) else None
 
-    def in_window(idx: int, work_ord: int) -> bool:
-        """Check if a work date is within the artist's window."""
-        c = cutoff_ord[idx]
-        if c is not None and work_ord > c:
-            return False
-        # Optional: enforce work_ord >= debut_ord[idx]
-        return True
-
     # Node metadata for edge covariates
     country = nodes_df.get("artist_country", pd.Series([None] * n_artists)).tolist()
     region = nodes_df.get("artist_region_city", pd.Series([None] * n_artists)).tolist()
@@ -185,142 +307,66 @@ def build_cowrite_graph_streaming(
     # ---- 2) Edge stats containers -------------------------------------------
     # pair_stats[(u_idx, v_idx)] = [weight_raw, weight_size_adj,
     #                               first_ord, last_ord, sum_team_size, joint_count]
-    pair_stats: Dict[Tuple[int, int], List] = {}
+    pair_stats: Dict[Tuple[int, int], List[Any]] = {}
 
     # Per-artist last release ordinal in-window (for recency reference)
     last_ord: List[Optional[int]] = [None] * n_artists
 
     LAMBDA = log(2.0) / recency_half_life_years if recency_half_life_years > 0 else 0.0
 
-    COWRITE_ROLES = {
-        "writer", "composer", "lyricist", "librettist", "scriptwriter", "translator",
-        "arranger", "instrument arranger", "orchestrator", "vocal arranger",
-        "adapter", "revised by", "reconstructed by",
-    }
+    # COWRITE_ROLES = {
+    #     "writer", "composer", "lyricist", "librettist", "scriptwriter", "translator",
+    #     "arranger", "instrument arranger", "orchestrator", "vocal arranger",
+    #     "adapter", "revised by", "reconstructed by",
+    # }
 
-    # ---- 3) Streaming pass over all artist JSONL files ----------------------
+    # ---- 3) Parallel streaming over all artist JSONL files ------------------
     files = sorted(artist_dir.glob("*.jsonl"))
-    outer_bar = tqdm(files, desc="Artist files", unit="file")
 
-    for path in outer_bar:
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                inner_bar = tqdm(
-                    f,
-                    desc=f"{path.name}",
-                    unit="artist",
-                    leave=False,
-                )
+    with ProcessPoolExecutor() as executor:
+        futures = {
+            executor.submit(
+                _process_artist_file,
+                path,
+                mbid_to_idx,
+                cutoff_ord,
+                # COWRITE_ROLES,
+            ): path
+            for path in files
+        }
 
-                for line in inner_bar:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        artist = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Artist files",
+            unit="file",
+        ):
+            pair_stats_local, last_ord_local = fut.result()
 
-                    a_mbid = artist.get("mbid")
-                    if not a_mbid:
-                        continue
+            # merge last_ord_local into global last_ord
+            for i, o_local in enumerate(last_ord_local):
+                if o_local is None:
+                    continue
+                o_global = last_ord[i]
+                if o_global is None or o_local > o_global:
+                    last_ord[i] = o_local
 
-                    a_roles = set(_to_roles(artist.get("roles")))
-                    work_date_ord = _compute_work_release_ordinals(artist)
-                    works = artist.get("works", []) or []
-
-                    for w in works:
-                        wid = w.get("id")
-                        if wid is None:
-                            continue
-                        work_ord = work_date_ord.get(wid)
-                        if work_ord is None:
-                            continue
-
-                        # Collect participants and their roles
-                        participants_roles: Dict[str, set] = {}
-                        participants_roles[a_mbid] = set(a_roles)
-
-                        for c in w.get("collaborators", []) or []:
-                            cm = c.get("mbid")
-                            if not cm:
-                                continue
-                            cr = set(_to_roles(c.get("roles")))
-                            if not cr:
-                                continue
-                            if cm in participants_roles:
-                                participants_roles[cm].update(cr)
-                            else:
-                                participants_roles[cm] = cr
-
-                        if not participants_roles:
-                            continue
-
-                        # Dedup: only lexicographically smallest mbid owns this work
-                        if a_mbid != min(participants_roles.keys()):
-                            continue
-
-                        # Build team
-                        cowwriters_all_mbids: List[str] = []
-                        cowwriters_idx: List[int] = []  # <-- correctly defined here
-
-                        for mbid, roles in participants_roles.items():
-                            if not (roles & COWRITE_ROLES):
-                                continue
-
-                            cowwriters_all_mbids.append(mbid)
-
-                            idx = mbid_to_idx.get(mbid)
-                            if idx is None:
-                                continue  # collaborator not in our node set
-
-                            if not in_window(idx, work_ord):
-                                continue
-
-                            cowwriters_idx.append(idx)
-
-                            # Track last in-window date per artist
-                            if last_ord[idx] is None or work_ord > last_ord[idx]:
-                                last_ord[idx] = work_ord
-
-                        n_full = len(cowwriters_all_mbids)
-                        if n_full < 2:
-                            continue
-                        if len(cowwriters_idx) < 2:
-                            continue
-
-                        denom = n_full * (n_full - 1) / 2.0
-                        adj_inc = 1.0 / denom if denom > 0 else 0.0
-
-                        for i in range(len(cowwriters_idx)):
-                            ui = cowwriters_idx[i]
-                            for j in range(i + 1, len(cowwriters_idx)):
-                                vi = cowwriters_idx[j]
-                                if ui == vi:
-                                    continue
-                                u_idx, v_idx = (ui, vi) if ui < vi else (vi, ui)
-                                key = (u_idx, v_idx)
-
-                                stats = pair_stats.get(key)
-                                if stats is None:
-                                    stats = [0, 0.0, work_ord, work_ord, 0, 0]
-                                    pair_stats[key] = stats
-
-                                stats[0] += 1
-                                stats[1] += adj_inc
-                                if work_ord < stats[2]:
-                                    stats[2] = work_ord
-                                if work_ord > stats[3]:
-                                    stats[3] = work_ord
-                                stats[4] += n_full
-                                stats[5] += 1
-
-                inner_bar.close()
-        except Exception:
-            # If a file blows up, keep going; tqdm will still move on.
-            continue
-
-    outer_bar.close()
+            # merge local pair_stats into global pair_stats
+            for key, stats_local in pair_stats_local.items():
+                w_raw_l, w_adj_l, first_l, last_l, sum_team_l, joint_l = stats_local
+                stats_global = pair_stats.get(key)
+                if stats_global is None:
+                    pair_stats[key] = stats_local[:]  # copy
+                else:
+                    # stats: [weight_raw, weight_size_adj, first_ord, last_ord, sum_team_size, joint_count]
+                    stats_global[0] += w_raw_l
+                    stats_global[1] += w_adj_l
+                    if first_l is not None and (stats_global[2] is None or first_l < stats_global[2]):
+                        stats_global[2] = first_l
+                    if last_l is not None and (stats_global[3] is None or last_l > stats_global[3]):
+                        stats_global[3] = last_l
+                    stats_global[4] += sum_team_l
+                    stats_global[5] += joint_l
 
     # ---- 4) Convert pair_stats to edges_df ----------------------------------
     def years_between(o1: int, o2: int) -> float:
@@ -351,7 +397,12 @@ def build_cowrite_graph_streaming(
 
         lu = last_ord[u_idx]
         lv = last_ord[v_idx]
-        if LAMBDA and lu is not None and lv is not None:
+        if (
+            LAMBDA
+            and lu is not None
+            and lv is not None
+            and last_c is not None
+        ):
             ref_edge = min(lu, lv)
             if ref_edge >= last_c:
                 years_since = years_between(last_c, ref_edge)
@@ -422,20 +473,21 @@ def build_cowrite_graph_streaming(
     # nodes_df is just your features_df, unchanged (apart from reset index)
     return edges_df, nodes_df
 
+
 def main():
     from pathlib import Path
-    import pandas as pd
     import os
 
-    features = pd.read_csv("./data/artist_base_features.csv")  # your 40MB file
+    features = pd.read_csv("./data/artist_base_features_5_years_only_collab.csv")  # your 40MB file
     edges_df, nodes_df = build_cowrite_graph_streaming(
         features_df=features,
-        artist_dir=Path("./data/artist_full_data"),
+        artist_dir=Path("./data/artist_filtered_data"),
         recency_half_life_years=3.0,
     )
-    os.makedirs('./data/graphs/better_graph', exist_ok=True)
+    os.makedirs("./data/graphs/only_connected", exist_ok=True)
 
-    edges_df.to_csv('./data/graphs/better_graph/edges.csv', index=False)
+    edges_df.to_csv("./data/graphs/only_connected/edges.csv", index=False)
+
 
 if __name__ == "__main__":
     main()

@@ -85,60 +85,46 @@ We expect **weak-tie residuals** and **bridging scores** to be especially predic
     Nodes: artists  
     Nodes: songs  
     Edges: contributions (writing, production, performance)  
-    Attributes: roles, release dates, genre tags, team sizes
+    Attributes: roles, release dates, genre tags, team sizes; derived from the first-N-song window defined in preprocessing.
     
 2. **Projected Artist–Artist Collaboration Network**  
     Edge weight metrics:
     - raw count of co-credits
     - team-size adjusted weight
     - recency-weighted collaboration strength
+    - weak-tie overlap indicator (`low_overlap`) exported for `edgecov`
         
 3. **Node Metadata**  
-    Includes genres, roles, release windows, productivity (number of songs), and time-in-network.
-    
-4. **Graph assembly + attribute standardization (current workflow in `network_construction/ergm_new_features.ipynb`)**  
-    - enforce canonical artist keys (`artist_mbid`/`mbid`) and convert all identifiers to character strings before graph construction  
-    - standardize numeric node covariates (`productivity_total`, `productivity_std`, `collab_count_std`, `tenure_std`) and surface convenience aliases (`num_songs_std`, `time_std`) for ERGM terms  
-    - sanitize edge attributes (weights, overlap scores, same-label indicators, low-overlap flags) so igraph/statnet receive consistent numeric inputs  
-    - build an undirected igraph from `nodes.csv`/`edges.csv` and convert it to a `statnet` network object for modeling
+    Includes `primary_genre`, `primary_label`, `primary_role`, `artist_country`, `artist_city`, release windows, standardized productivity counts (`num_songs_std`, `collab_count_std`), and time-in-network (`time_std`) so ERGM formulas can encode opportunity.
     
 
 ---
 
 ### **5.2 Structural Models (ERGMs)**
 
-The R/statnet workflow in `network_construction/ergm_new_features.ipynb` now walks through a staged specification so we can isolate where each mechanism becomes identifiable:
+We build a ladder of ERGMs (`statnet`) so each conceptual mechanism is added transparently:
 
-1. **Model 0 — Baseline density (`edges`)**  
-   MPLE fit that confirms the collaboration network is extremely sparse (≈0.2% tie probability).
+- **Model 0 — Baseline density.** `edges = -6.30` (`logit^{-1} ≈ 0.0018`), confirming the sparse null that later odds-ratio interpretations reference.
+- **Model 1 — Core structure.** Adds `gwesp(0.5,fixed=TRUE)` and `gwdegree(0.8,fixed=TRUE)`; closure ≈ 4.5 (90× odds), while degree penalty (≈ -3.2) keeps hubs realistic.
+- **Model 2 — Homophily.** Extends Model 1 with `nodematch` on `primary_genre`, `primary_label`, `primary_role`, `artist_country`, `artist_city`; all positive even after structural controls, evidencing creative clustering.
+- **Model 3 — Exposure controls.** Adds `nodecov(num_songs_std)`, `nodecov(collab_count_std)`, `absdiff(time_std)` and switches to Contrastive Divergence. Productivity (≈ 0.17) and aligned tenure (≈ 0.15) are significant; closure strengthens (`gwesp ≈ 5.3`) and genre homophily ≈ 2.0.
+- **Model 4 — Weak ties.** Introduces `edgecov(low_overlap)` derived from neighborhood overlap/bridging scores. Its positive coefficient tests Goal 3 directly, showing weak ties are overrepresented even after density, structure, homophily, and exposure controls.
 
-2. **Model 1 — Core structure (`edges + gwesp + gwdegree`)**  
-   Adds geometrically weighted ESP (triadic closure) and degree to capture clustering and hub-formation; both show large, well-signed coefficients.
-
-3. **Model 2 — Homophily (`+ nodematch("primary_genre")`)**  
-   After testing all available attributes, genre matching is the only similarity term that remains stable, so the notebook keeps it and drops problematic role/label terms.
-
-4. **Model 3 — Exposure controls (`+ nodecov(productivity_std) + nodecov(collab_count_std)`)**  
-   Uses Contrastive Divergence for estimation once opportunity terms enter the model. Productivity and collaboration intensity absorb part of the tie propensity while leaving closure and degree effects intact.
-
-5. **Model 4 — Weak-tie emphasis (`+ gwdsp`, optional `edgecov(low_overlap)`)**  
-   Introduces geometrically weighted shared partners for dyads (open triads) plus a low-embeddedness edge covariate derived from edges with ≤1 mutual collaborator. This stage isolates weak-tie formation beyond what the closure term explains.
-
-Across stages we rely on MPLE for quick screening, then refit key specifications via CD for stable inference and goodness-of-fit checks. Diagnostics from each step determine which mechanisms feed into subsequent feature engineering and hypothesis tests.
+Each rung supplies mechanism-specific coefficients, diagnostics, and simulated expectations that we later convert into residual node features and hypothesis tests.
 
 ---
 
-### **5.3 Node-Level Network Feature Engineering**
+### **5.3 Node-Level Feature Engineering**
 
-`ergm_new_features.ipynb` now exports a canonical `node_features.csv` that joins every artist/MBID with a battery of graph-derived metrics aligned to the ERGM terms. Feature families include:
+We align node features with the ERGM terms while adding diagnostics for prediction:
 
-- **Local cohesion + triads**: local clustering coefficient, triangle counts, open wedges, GWESP-style node scores that weight edges by shared-partner intensity.  
-- **Positional structure**: degree/log-degree, eigenvector centrality, PageRank, k-core, betweenness, closeness, and minimum distance to the top-k hubs.  
-- **Weak-tie + bridging signals**: fraction of an artist’s ties with ≤1 shared partner (`weak_tie_frac`), open-dyad opportunities, Louvain community participation coefficients, and component membership/size.  
-- **Homophily context**: share of neighbors matching primary genre/label/role, triangles that stay within or span across those attributes, and participation in cross-genre triads.  
-- **Opportunity controls**: productivity and tenure standard scores carried over from the data clean-up step so predictive models can control for exposure alongside structure.
+- **Local structure:** clustering coefficients, triangle counts (overall plus within/across genre/label/role), open wedges, and a `gwesp`-style closure score per artist.
+- **Centrality & core:** degree/log-degree, eigenvector, betweenness, closeness, k-core index, and minimum distance to the network’s hubs.
+- **Opportunity windows:** component sizes, two-hop reach, open dyads, standardized productivity (`num_songs_std`, `collab_count_std`), and tenure (`time_std`).
+- **Diversity & weak ties:** weak-tie edge fractions, neighborhood composition (same-genre/label/role shares), cross-community participation coefficients.
+- **Model-informed residuals:** observed vs. ERGM-expected degrees, triangles, weak-tie scores, and closure-pressure residuals.
 
-These metrics give us observable counterparts to each ERGM mechanism; we can later augment them with simulation-based residuals once the final ERGM specification is locked.
+These outputs feed both hypothesis tests (Goal 3) and supervised models (Goal 2) by capturing how each artist deviates from the generative baseline.
 
 ---
 
@@ -169,14 +155,14 @@ We measure performance improvements to quantify the predictive contribution of n
 
 ### **5.5 Hypothesis Testing & Feature Pruning**
 
-Using the staged ERGM fits:
+Using ERGMs:
 
-- Keep only feature families whose corresponding ERGM terms remain significant and well-signed after exposure controls (e.g., GWESP, GWDEGREE, genre homophily).  
-- If a structural effect collapses once productivity/tenure terms enter, drop or down-weight its derived features in downstream models.  
-- Use CD-based GOF to decide whether adding `gwdsp` or the low-overlap edge covariate materially improves fit; only then do we propagate weak-tie residuals.  
-- Cross-check node-level weak-tie fractions, community participation, and open-dyad measures against the Model 4 coefficients to validate H1-oriented predictors.
+- **Term stability.** Significant, well-mixed coefficients (closure, homophily, weak ties) justify keeping their related features in the predictive design matrix.
+- **Exposure-aware pruning.** If an effect vanishes once `nodecov`/`absdiff` controls enter, we drop the associated features to avoid conflating opportunity with structure.
+- **GOF-driven emphasis.** Terms that materially improve GOF or diagnose misfit guide which residuals to compute and highlight in the narrative.
+- **Weak-tie confirmation.** Evidence that `edgecov(low_overlap) > 0` provides the empirical hook for Goal 3; the same edge covariate underlies the node-level weak-tie fractions.
 
-This keeps feature selection **mechanism-driven** while ensuring weak-tie interpretations rest on an exposure-controlled ERGM.
+This produces a **mechanism-driven feature selection process** linking ERGM diagnostics to predictive modeling.
 
 ---
 
@@ -208,7 +194,7 @@ This keeps feature selection **mechanism-driven** while ensuring weak-tie interp
 
 ### **3. Data**
 
-- MusicBrainz and spotify
+- MusicBrainz and Spotify
     
 - Collaboration extraction
     
@@ -223,31 +209,34 @@ This keeps feature selection **mechanism-driven** while ensuring weak-tie interp
 
 #### 4.1 Network Model (Bipartite → Projection)
 
+- first-N-song window, MusicBrainz→Spotify integration, conversion to `network`
+- projected artist graph stored in `data/graphs/better_graph`
+
 #### 4.2 Node and Edge Attributes
 
-#### 4.3 ERGM Framework
+- role, genre, label, geography metadata (`primary_*`, artist country/city)
+- standardized productivity (`num_songs_std`, `collab_count_std`), tenure (`time_std`)
+- weak-tie overlap indicator used as `edgecov`
 
-- structural terms
-    
-- homophily
-    
-- exposure
-    
-- weak ties
-    
+#### 4.3 ERGM Ladder (Models 0–4)
+
+- Model 0: density null (`edges = -6.30`)
+- Model 1: add `gwesp`/`gwdegree` for structure
+- Model 2: add homophily (`nodematch` genre/label/role/geography)
+- Model 3: add exposure controls (`nodecov`, `absdiff`) with CD estimation
+- Model 4: add weak-tie `edgecov(low_overlap)` to test Goal 3
 
 #### 4.4 Node-Level Feature Engineering
 
-- structural features
-    
-- ERGM-derived expected/residual metrics
-    
+- closure/triangle metrics (overall + within/across attributes), open wedges
+- centrality/core measures, hub-distance, component sizes
+- opportunity windows (open dyads, two-hop reach, standardized productivity/tenure)
+- weak-tie fractions, community participation, ERGM residual diagnostics
 
 #### 4.5 Predictive Modeling
 
 - baseline vs. network vs. ERGM-informed models
-    
-- evaluation strategy
+- evaluation strategy and hypothesis-aligned feature pruning
     
 
 ### **5. Results**
