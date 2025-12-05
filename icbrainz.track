@@ -1,0 +1,23 @@
+                                      Table "musicbrainz.l_artist_work"
+     Column     |           Type           | Collation | Nullable |                  Default                  
+----------------+--------------------------+-----------+----------+-------------------------------------------
+ id             | integer                  |           | not null | nextval('l_artist_work_id_seq'::regclass)
+ link           | integer                  |           | not null | 
+ entity0        | integer                  |           | not null | 
+ entity1        | integer                  |           | not null | 
+ edits_pending  | integer                  |           | not null | 0
+ last_updated   | timestamp with time zone |           |          | now()
+ link_order     | integer                  |           | not null | 0
+ entity0_credit | text                     |           | not null | ''::text
+ entity1_credit | text                     |           | not null | ''::text
+Indexes:
+    "l_artist_work_pkey" PRIMARY KEY, btree (id)
+    "idx_l_artist_work_e0_e1" btree (entity0, entity1)
+    "idx_l_artist_work_entity0_link_entity1" btree (entity0, link, entity1)
+    "idx_l_artist_work_entity1_link_entity0" btree (entity1, link, entity0)
+    "l_artist_work_idx_entity1" btree (entity1)
+    "l_artist_work_idx_uniq" UNIQUE, btree (entity0, entity1, link, link_order)
+Check constraints:
+    "l_artist_work_edits_pending_check" CHECK (edits_pending >= 0)
+    "l_artist_work_link_order_check" CHECK (link_order >= 0)
+

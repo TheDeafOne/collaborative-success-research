@@ -3,11 +3,12 @@ name = "nepo-music"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.7",
     "networkx>=3.5",
+    "node2vec>=0.5.0",
     "pandas>=2.3.3",
     "psycopg[binary]>=3.1",
     "python-dotenv>=1.2.1",
