@@ -108,7 +108,7 @@ We build a ladder of ERGMs (`statnet`) so each conceptual mechanism is added tra
 - **Model 1 — Core structure.** Adds `gwesp(0.5,fixed=TRUE)` and `gwdegree(0.8,fixed=TRUE)`; closure ≈ 4.5 (90× odds), while degree penalty (≈ -3.2) keeps hubs realistic.
 - **Model 2 — Homophily.** Extends Model 1 with `nodematch` on `primary_genre`, `primary_label`, `primary_role`, `artist_country`, `artist_city`; all positive even after structural controls, evidencing creative clustering.
 - **Model 3 — Exposure controls.** Adds `nodecov(num_songs_std)`, `nodecov(collab_count_std)`, `absdiff(time_std)` and switches to Contrastive Divergence. Productivity (≈ 0.17) and aligned tenure (≈ 0.15) are significant; closure strengthens (`gwesp ≈ 5.3`) and genre homophily ≈ 2.0.
-- **Model 4 — Weak ties.** Introduces `edgecov(low_overlap)` derived from neighborhood overlap/bridging scores. Its positive coefficient tests Goal 3 directly, showing weak ties are overrepresented even after density, structure, homophily, and exposure controls.
+- **Model 4 — Weak ties.** Introduces `gwdsp` derived from neighborhood overlap/bridging scores. Its positive coefficient tests Goal 3 directly, showing weak ties are overrepresented even after density, structure, homophily, and exposure controls.
 
 Each rung supplies mechanism-specific coefficients, diagnostics, and simulated expectations that we later convert into residual node features and hypothesis tests.
 
@@ -160,122 +160,210 @@ Using ERGMs:
 - **Term stability.** Significant, well-mixed coefficients (closure, homophily, weak ties) justify keeping their related features in the predictive design matrix.
 - **Exposure-aware pruning.** If an effect vanishes once `nodecov`/`absdiff` controls enter, we drop the associated features to avoid conflating opportunity with structure.
 - **GOF-driven emphasis.** Terms that materially improve GOF or diagnose misfit guide which residuals to compute and highlight in the narrative.
-- **Weak-tie confirmation.** Evidence that `edgecov(low_overlap) > 0` provides the empirical hook for Goal 3; the same edge covariate underlies the node-level weak-tie fractions.
+- **Weak-tie confirmation.** Evidence that `gwdsp > 0` provides the empirical hook for Goal 3; the same edge covariate underlies the node-level weak-tie fractions.
 
 This produces a **mechanism-driven feature selection process** linking ERGM diagnostics to predictive modeling.
 
 ---
+# 1. Introduction
+## 1.1 Motivation
+Collaboration networks are central to creative industries. Early-career structural positioning may predict long-term success. We focus on deriving predictive value from collaboration patterns using network science + machine learning.
 
-# 6. 📑 High-Level Paper Outline
+## 1.2 Key Questions
+What mechanisms shape how collaboration networks form?  
+Can early-career structural features predict future success?  
+Which aspects of network position (weak ties, closure, homophily) matter most?
 
-### **1. Introduction**
+## 1.3 Contributions
+Construct a large-scale, early-career collaboration network.  
+Fit ERGMs to uncover generative mechanisms of tie formation.  
+Translate ERGM terms → node-level predictive features.  
+Add learned node embeddings (node2vec).  
+Train XGBoost regression models to predict success (Spotify followers).  
+Demonstrate gains from network-informed features.
 
-- Motivation
-    
-- Importance of collaboration in creative industries
-    
-- Weak vs. strong ties
-    
-- Research gap
-    
-- Contribution of this study
-    
+# 2. Background and Related Work (Concise Outline)
 
-### **2. Background & Theory**
+## 2.1 Networks, Collaboration, and Creative Success
+- Network position shapes opportunity (weak ties, structural holes).
+- Small-world team structures improve creative outcomes.
+- Early network embeddedness predicts long-run success across arts and sciences.
+- Principle: success depends on both talent and collaboration structure.
 
-- Granovetter and weak-tie theory
-    
-- Cultural production networks
-    
-- Prior computational models of creative collaboration
-    
-- Why network structure may predict artistic success
-    
+## 2.2 Collaboration Networks in Music
+- Music networks show large connected components, genre clusters, cumulative advantage.
+- Collaboration-profile studies identify structural types tied to chart success; some transitions precede success gains.
+- Centrality and mentorship/co-credit ties relate to popularity.
+- High-status partnerships improve chart performance.
 
-### **3. Data**
+## 2.3 Predicting Success in Music
+### 2.3.1 Song-level (Hit Song Science)
+- Focus on predicting song popularity using audio/multimodal features.
+- Gaps: limited modeling of artist careers or collaboration networks.
 
-- MusicBrainz and Spotify
-    
-- Collaboration extraction
-    
-- First-n-songs design
-    
-- Network construction
-    
-- Preprocessing pipeline
-    
+### 2.3.2 Artist-level
+- Large-scale models use centrality + productivity but rely on full-career aggregates.
+- Panel-data studies are small and sparse.
+- Missing: systematic modeling of early-career network structure.
 
-### **4. Methods**
+## 2.4 Adjacent Creative Fields
+- Visual art and film show early network pathways predict career outcomes.
+- Hot-streak research highlights clustered impact shaped by early opportunity.
+- Early-career network signals are broadly predictive.
 
-#### 4.1 Network Model (Bipartite → Projection)
+## 2.5 Network Models and Representation Learning
+- ERGMs capture generative mechanisms but are rarely applied in music.
+- Node2vec embeddings capture higher-order structure but are underused for artist prediction.
+- Opportunity: integrate ERGM-informed features with learned representations.
 
-- first-N-song window, MusicBrainz→Spotify integration, conversion to `network`
-- projected artist graph stored in `data/graphs/better_graph`
+## 2.6 Positioning of Present Work
+- Gaps: few artist-level models, little early-career focus, minimal generative network modeling.
+- Our approach:
+  - Build early-career collaboration networks (MusicBrainz + Spotify).
+  - Fit ERGMs to identify structural mechanisms.
+  - Convert mechanisms into predictive features + node2vec embeddings.
+  - Evaluate improvements in forecasting long-term artist success.
+- Goal: emulate A&R/investor decision-making using only first-five-year collaborations.
 
-#### 4.2 Node and Edge Attributes
+# 3. Data & Network Construction
+## 3.1 Data Sources
+MusicBrainz (collaborations, roles, metadata).  
+Spotify API (followers, popularity, genres).
 
-- role, genre, label, geography metadata (`primary_*`, artist country/city)
-- standardized productivity (`num_songs_std`, `collab_count_std`), tenure (`time_std`)
-- weak-tie overlap indicator used as `edgecov`
+## 3.2 Early-Career Window
+Use first 5 years of each artist’s career.  
+Success measured at present day (Spotify followers).
 
-#### 4.3 ERGM Ladder (Models 0–4)
+## 3.3 Artist–Song Bipartite Graph
+Nodes: artists | songs.  
+Edges: writing, producing, performing relationships.  
+Attributes: roles, release dates, team sizes, genres.
 
-- Model 0: density null (`edges = -6.30`)
-- Model 1: add `gwesp`/`gwdegree` for structure
-- Model 2: add homophily (`nodematch` genre/label/role/geography)
-- Model 3: add exposure controls (`nodecov`, `absdiff`) with CD estimation
-- Model 4: add weak-tie `edgecov(low_overlap)` to test Goal 3
+## 3.4 Projected Artist Collaboration Network
+Edge weights: raw co-writes, team-size adjusted, recency-weighted.  
+Weak-tie overlap computed from neighbor overlap.
 
-#### 4.4 Node-Level Feature Engineering
+## 3.5 Cleaning & Filtering
+Remove non-person entities, resolve duplicates, handle missing metadata.  
+Restrict to artists with minimum releases + Spotify presence.
 
-- closure/triangle metrics (overall + within/across attributes), open wedges
-- centrality/core measures, hub-distance, component sizes
-- opportunity windows (open dyads, two-hop reach, standardized productivity/tenure)
-- weak-tie fractions, community participation, ERGM residual diagnostics
+## 3.6 Descriptive Statistics
+Degree distribution, components, genre breakdown, temporal coverage.
 
-#### 4.5 Predictive Modeling
+# 4. Network Formation Modeling (ERGMs)
+## 4.1 Purpose
+Identify mechanisms explaining tie formation.  
+Provide generative baseline informing node-level features.
 
-- baseline vs. network vs. ERGM-informed models
-- evaluation strategy and hypothesis-aligned feature pruning
-    
+## 4.2 Model Ladder
+Model 0: density.  
+Model 1: structural terms (gwesp, gwdegree).  
+Model 2: homophily (genre, role, label, geography).  
+Model 3: opportunity controls (productivity, collaboration count, tenure).  
+Model 4: weak-tie term (gwdsp).
 
-### **5. Results**
+## 4.3 Findings
+Strong triadic closure.  
+Clear homophily.  
+Productivity & exposure effects.  
+Weak ties overrepresented after controls.
 
-- ERGM results: structural effects
-    
-- Network topology description
-    
-- Weak-tie insight
-    
-- Predictive model comparison
-    
-- Feature importance
-    
+## 4.4 Diagnostics
+MCMC convergence, goodness-of-fit, simulation validation.
 
-### **6. Discussion**
+# 5. Node-Level Feature Engineering
+## 5.1 Structural Features
+Degree, log-degree, eigenvector, betweenness, closeness, k-core.  
+Distance to hubs, component metrics.
 
-- Interpretation
-    
-- Implications for creative industries
-    
-- Theoretical implications
-    
-- Limitations
-    
+## 5.2 Triadic / Closure Features
+Clustering coefficient, triangle counts, open wedges.  
+ERGM-style closure proxies.
 
-### **7. Conclusion**
+## 5.3 Homophily Features
+Same-genre / same-label / same-role neighbor fractions.  
+Within- and cross-community interactions.
 
-- Summary
-    
-- Future directions
-    
+## 5.4 Weak-Tie & Bridging Features
+Edge embeddedness / overlap.  
+Weak-tie fractions, participation coefficients.  
+Structural-hole indicators.
 
-### **Appendix**
+## 5.5 Productivity & Opportunity Features
+Release counts, collaborator counts, tenure.  
+Activity alignment windows.
 
-- Full feature list
-    
-- ERGM diagnostics
-    
-- Sensitivity analyses
-    
-- Robustness checks
+## 5.6 ERGM-Informed Residuals
+Observed vs expected degree, triangles, weak-tie levels.  
+Closure- and bridging-pressure deviations.
+
+## 5.7 Node2Vec Embeddings
+Learn 128–256 dimensional embeddings.  
+Capture latent structure.  
+Concatenate with engineered features.
+
+# 6. Predictive Modeling
+## 6.1 Success Metric
+Spotify follower count (log-transformed).
+
+## 6.2 Model Comparisons
+Baseline (metadata).  
++ Network features.  
++ ERGM-informed features.  
++ Node2vec.  
+Full model: metadata + network + ERGM + embeddings.
+
+## 6.3 Training Setup
+Train/test split by debut cohort.  
+XGBoost primary model; ridge + RF for comparison.  
+Hyperparameter tuning, cross-validation.
+
+## 6.4 Results
+Network features improve performance.  
+ERGM + weak-tie features give further lift.  
+Node2vec improves still more.  
+Feature importance highlights weak ties, closure, bridging.
+
+# 7. Discussion
+## 7.1 Interpretation
+Early collaboration structure predicts long-term success.  
+Weak ties & cross-community bridging matter.  
+ERGM-informed features add value.
+
+## 7.2 Practical Implications
+Data-driven A&R scouting.  
+Network-aware prediction complements audio-based models.
+
+## 7.3 Limitations
+Missing metadata, geographic bias.  
+Spotify as proxy for success.  
+Static early-career window.
+
+## 7.4 Future Work
+Dynamic ERGMs, temporal embeddings.  
+Multimodal modeling.  
+Cross-platform success metrics.
+
+# 8. Conclusion
+Summary of findings and contributions.  
+Network structure is central to predicting artistic success.  
+Combining ERGMs and ML yields actionable insights.
+
+
+
+
+# Look into
+how stable are some of these categorical factors (does removing them effect the coefficients of the other factors?)
+for each of these factors, how much of the variance is "soaked up" by them. If a categorical variable is soaking up variance, it might be skewing the results of other factors.
+
+- check out the diameter of the network
+
+
+multiple paper writing (talk about different portions of what we did):
+you can gain better understanding of the domain
+you can talk about the methods
+
+
+Talk about whats novel about the paper/process in the intro and background
+spend time thinking about the novelty - natural tendency is to think about the linear work (no bad)
+think about what you discovered. 

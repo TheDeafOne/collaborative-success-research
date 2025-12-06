@@ -1,0 +1,3 @@
+feature_set,model,rmse,mae,r2,rmse_log,r2_log,best_params
+graph_augmented,xgboost,2036213.518737831,259665.74238414853,-0.01335254245509665,2.9057456703719016,0.1978862709609588,"{'regressor__model__subsample': 0.6, 'regressor__model__reg_lambda': 1, 'regressor__model__n_estimators': 200, 'regressor__model__min_child_weight': 10, 'regressor__model__max_depth': 3, 'regressor__model__learning_rate': 0.01, 'regressor__model__colsample_bytree': 1.0}"
+graph_augmented,catboost,2014906.3815509854,255753.4149430477,0.007744138142807722,2.701915951475563,0.30647132607718,"{'regressor__model__learning_rate': 0.05, 'regressor__model__l2_leaf_reg': 5, 'regressor__model__iterations': 1000, 'regressor__model__depth': 8, 'regressor__model__bagging_temperature': 0.5}"
