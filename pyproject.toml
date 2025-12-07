@@ -7,7 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
     "catboost>=1.2.8",
     "ipykernel>=7.1.0",
+    "louvain>=0.8.2",
     "matplotlib>=3.10.7",
+    "networkit>=11.2",
     "networkx>=3.5",
     "node2vec>=0.5.0",
     "pandas>=2.3.3",
