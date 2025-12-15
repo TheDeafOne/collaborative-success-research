@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from itertools import islice
 import pandas as pd
+from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 print(ROOT)
 sys.path.append(str(ROOT))
@@ -84,37 +85,23 @@ def main() -> None:
     processed = 0
     failures = 0
 
-    for batch_idx, mbid_batch in enumerate(chunked(all_mbids, BATCH_SIZE), start=1):
-        print(f"\n--- starting batch {batch_idx} with {len(mbid_batch)} artists ---", flush=True)
-        try:
-            for artist_works_data in mb.stream_artists_songs_by_mbids(mbid_batch):
-                processed += 1
+    with tqdm(total=total, desc="Artists", unit="artist") as pbar:
+        for batch_idx, mbid_batch in enumerate(chunked(all_mbids, BATCH_SIZE), start=1):
+            try:
+                for artist_works_data in mb.stream_artists_songs_by_mbids(mbid_batch):
+                    processed += 1
+                    pbar.update(1)
 
-                try:
-                    # if not artist_works_data.get("works"):
-                    #     mbid = artist_works_data["mbid"]
-                    #     print("getting data for empty artist:", mbid)
-
-                    #     # fallback to Spotify data
-                    #     spotify_id = mbid_to_spotify_id_map.get(mbid)
-                    #     if spotify_id is None:
-                    #         raise KeyError(f"no spotify id for mbid {mbid}")
-
-                    #     artist_works_data = sp.get_spotify_artist(spotify_id)
-                    #     artist_works_data["mbid"] = mbid
-
-                    write_obj(artist_works_data)
-
-                except Exception as exc:
-                    failures += 1
-                    artist_mbid = artist_works_data.get("mbid")
-                    print(f"failed to process artist {artist_mbid}: {exc}")
-                    print(f"this was artist index {processed}")
-        except Exception as exc:
-            print(f"failed to process chunk {batch_idx}: {exc}")
-            print(f"this was artist index {processed}")
-        if processed % 1000 == 0:
-            print(f"processed {processed} artists so far (failures={failures})", flush=True)
+                    try:
+                        write_obj(artist_works_data)
+                    except Exception as exc:
+                        failures += 1
+                        artist_mbid = artist_works_data.get("mbid")
+                        print(f"failed to process artist {artist_mbid}: {exc}")
+                        print(f"this was artist index {processed}")
+            except Exception as exc:
+                print(f"failed to process chunk {batch_idx}: {exc}")
+                print(f"this was artist index {processed}")
 
     print(f"\nDone. processed={processed}, failures={failures}", flush=True)
 

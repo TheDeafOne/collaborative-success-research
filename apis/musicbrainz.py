@@ -29,6 +29,7 @@ from uuid import UUID
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
+from tqdm import tqdm
 
 
 def _connect() -> psycopg.Connection:
@@ -325,12 +326,24 @@ def dump_all_artist_mbids(output_path: str | Path, batch_size: int = 50_000) -> 
     start = time.time()
     total = 0
 
-    with out_path.open("w", encoding="utf-8") as fh:
-        for total, mbid in enumerate(stream_all_artist_mbids(batch_size=batch_size), start=1):
-            fh.write(f"{mbid}\n")
-            if total % 100_000 == 0:
-                elapsed = time.time() - start
-                print(f"  wrote {total:,} mbids so far ({elapsed:0.1f}s)")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM artist WHERE gid IS NOT NULL")
+            total_count = cur.fetchone()[0] or 0
+
+        with conn.cursor(name="artist_gid_stream") as cur:
+            cur.itersize = batch_size
+            cur.execute("SELECT gid FROM artist WHERE gid IS NOT NULL")
+            with out_path.open("w", encoding="utf-8") as fh, tqdm(
+                total=total_count,
+                desc="Artist MBIDs",
+                unit="artist",
+            ) as pbar:
+                for (gid,) in cur:
+                    if gid:
+                        fh.write(f"{gid}\n")
+                        total += 1
+                    pbar.update(1)
 
     elapsed = time.time() - start
     print(f"Finished writing {total:,} artist mbids to {out_path} in {elapsed:0.1f}s")
