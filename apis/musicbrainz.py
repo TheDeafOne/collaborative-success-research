@@ -22,6 +22,7 @@ import math
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from uuid import UUID
 
@@ -292,6 +293,48 @@ def ensure_mbz_perf_objects() -> None:
         )
 
         conn.commit()
+
+
+def stream_all_artist_mbids(batch_size: int = 50_000) -> Iterator[str]:
+    """
+    Stream every artist MBID (gid) from the local MusicBrainz database.
+
+    Uses a server-side cursor to avoid loading the full artist table into memory.
+    """
+    query = "SELECT gid FROM artist WHERE gid IS NOT NULL"
+
+    with _connect() as conn:
+        # server-side cursor so results are streamed
+        with conn.cursor(name="artist_gid_stream") as cur:
+            cur.itersize = batch_size
+            cur.execute(query)
+            for (gid,) in cur:
+                if gid:
+                    yield str(gid)
+
+
+def dump_all_artist_mbids(output_path: str | Path, batch_size: int = 50_000) -> Path:
+    """
+    Write all artist MBIDs to a newline-delimited text file.
+
+    Returns the resolved output path.
+    """
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    start = time.time()
+    total = 0
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        for total, mbid in enumerate(stream_all_artist_mbids(batch_size=batch_size), start=1):
+            fh.write(f"{mbid}\n")
+            if total % 100_000 == 0:
+                elapsed = time.time() - start
+                print(f"  wrote {total:,} mbids so far ({elapsed:0.1f}s)")
+
+    elapsed = time.time() - start
+    print(f"Finished writing {total:,} artist mbids to {out_path} in {elapsed:0.1f}s")
+    return out_path
 
 AUTHOR_ROLES = [
     # writing

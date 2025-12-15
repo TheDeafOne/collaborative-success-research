@@ -27,8 +27,6 @@ def main() -> None:
                 lowered = url.lower()
                 if "spotify" in lowered:
                     valid["spotify"] = url
-                if "last.fm" in lowered:
-                    valid["last.fm"] = url
             if valid:
                 mapping[str(artist_mbid)] = valid
         except Exception as exc:
