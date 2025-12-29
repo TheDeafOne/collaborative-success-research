@@ -6,6 +6,8 @@ IpSolveAPI.out
 nohup.out
 robustbase.out 
 
+**/results
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

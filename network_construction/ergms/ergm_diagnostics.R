@@ -3,7 +3,6 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(intergraph)
   library(igraph)
-  library(ergm.count)
 })
 
 # ---------------- helpers ----------------
@@ -21,12 +20,7 @@ get_script_dir <- function() {
   if (length(match) > 0) {
     return(dirname(normalizePath(sub(file_arg, "", cmd_args[match]))))
   }
-  # fallback to current working directory
   normalizePath(getwd())
-}
-
-ergm_formula_from_terms <- function(terms) {
-  as.formula(paste("net ~", paste(terms, collapse = " + ")))
 }
 
 ensure_dir <- function(path) {
@@ -34,11 +28,31 @@ ensure_dir <- function(path) {
   path
 }
 
+has_vertex_attr <- function(g, attr) attr %in% vertex_attr_names(g)
+
 # ---------------- config ----------------
-# Use a small subgraph for quick pipeline validation.
-sample_graph <- FALSE
-sample_nodes_target <- 5000
+# Keep in sync with ergm_new_features.R sampling to avoid mismatched diagnostics.
+sample_graph <- TRUE
+sample_nodes_target <- 50
 sample_seed <- 42
+
+# Diagnostics toggles.
+run_gof <- TRUE
+run_mcmc_diagnostics <- TRUE
+refit_mcmle_for_mcmc <- FALSE  # set TRUE if you want MCMC diagnostics on MCMLE fits
+
+# GOF configuration (reduce nsim for speed on large graphs).
+gof_nsim <- 50
+gof_formula <- ~degree + espartners + dspartners
+
+# MCMLE configuration (only used if refit_mcmle_for_mcmc = TRUE).
+mcmle_control <- control.ergm(
+  MCMC.interval = 1024,
+  MCMC.samplesize = 4096,
+  MCMLE.maxit = 20
+)
+
+# Attributes used in ERGM terms (for NA cleanup, same as fitting script).
 required_nodematch_attrs <- c(
   "primary_genre", "primary_role",
   "artist_country", "primary_label",
@@ -47,50 +61,19 @@ required_nodematch_attrs <- c(
 required_numeric_attrs <- c("time_std", "collab_count_std", "num_songs_std")
 required_source_attrs <- c("years_active", "unique_collaborator_count", "tracks_total")
 
-safe_fit <- function(
-  name,
-  formula,
-  net,
-  results_dir,
-  control_ergm = control.ergm(MPLE.samplesize = 1e5, MPLE.covariance.samplesize = 0)
-) {
-  log_path <- file.path(results_dir, "errors.log")
-  model <- NULL
-  err <- NULL
-
-  log_step(paste0("Fitting ", name, " with ergm (MPLE)"))
-  tryCatch({
-    model <- ergm(
-      formula,
-      estimate = "MPLE",
-      control = control_ergm
-    )
-  }, error = function(e) {
-    err <<- e
-    log_error(paste("ergm failed for", name, ":", conditionMessage(e)), log_path)
-    stop(e)
-  })
-
-  # Save outputs on success
-  if (!is.null(model)) {
-    saveRDS(model, file.path(results_dir, paste0(name, ".rds")))
-    capture.output(summary(model), file = file.path(results_dir, paste0(name, "_summary.txt")))
-    log_step(paste("Saved model and summary for", name))
-  }
-
-  list(model = model, error = err)
-}
-
 # ---------------- paths ----------------
 script_dir <- get_script_dir()
 data_dir <- normalizePath(file.path(script_dir, "..", "..", "data", "graphs", "only_connected"))
 results_dir <- ensure_dir(file.path(script_dir, "results"))
+diag_dir <- ensure_dir(file.path(results_dir, "diagnostics"))
+log_path <- file.path(diag_dir, "diagnostics_errors.log")
 
 log_step(paste("Script directory:", script_dir))
 log_step(paste("Data directory:", data_dir))
 log_step(paste("Results directory:", results_dir))
+log_step(paste("Diagnostics directory:", diag_dir))
 
-# ---------------- data load ----------------
+# ---------------- data load / graph prep ----------------
 log_step("Loading nodes and edges")
 nodes <- read.csv(file.path(data_dir, "nodes.csv"), stringsAsFactors = FALSE)
 edges <- read.csv(file.path(data_dir, "edges.csv"), stringsAsFactors = FALSE)
@@ -128,7 +111,7 @@ nodes_df$placeholder <- FALSE
 
 log_step(sprintf("Nodes: %s, Edges: %s", nrow(nodes_df), nrow(edges_df)))
 
-# If sampling, keep only a small induced subgraph to speed iteration
+# Sampling for quick diagnostics, keep in sync with fitting script
 if (sample_graph) {
   set.seed(sample_seed)
   edge_ids <- unique(c(edges_df$u, edges_df$v))
@@ -152,28 +135,17 @@ if (sample_graph) {
   log_step(sprintf("Sampled graph: nodes=%s, edges=%s", nrow(nodes_df), nrow(edges_df)))
 }
 
-# Ensure vertex set covers all edge endpoints; create placeholder vertices for any missing IDs
+# Add placeholder vertices for missing IDs
 nodes_df <- nodes_df %>% distinct(mbid, .keep_all = TRUE)
 edge_ids <- unique(c(edges_df$u, edges_df$v))
 missing_ids <- setdiff(edge_ids, nodes_df$mbid)
 if (length(missing_ids) > 0) {
   log_step(sprintf("Adding %s placeholder vertices missing from nodes", length(missing_ids)))
-  # Create placeholder rows with NA for other attributes
   placeholder <- data.frame(mbid = missing_ids, placeholder = TRUE, stringsAsFactors = FALSE)
-  # Ensure placeholder has all node columns
   for (col in setdiff(names(nodes_df), names(placeholder))) {
     placeholder[[col]] <- NA
   }
   nodes_df <- bind_rows(nodes_df, placeholder)
-}
-
-# Require source columns for derived features.
-missing_source_cols <- setdiff(required_source_attrs, names(nodes_df))
-if (length(missing_source_cols) > 0) {
-  stop(paste0(
-    "nodes missing required source columns: ",
-    paste(missing_source_cols, collapse = ", ")
-  ))
 }
 
 # Fill missing categorical attributes with "unknown".
@@ -222,38 +194,17 @@ nodes_df$time_std[!non_placeholder] <- 0
 nodes_df$collab_count_std[!non_placeholder] <- 0
 nodes_df$num_songs_std[!non_placeholder] <- 0
 
-# Require complete attributes for all ERGM terms; fail fast if any are missing.
-missing_attr <- character(0)
-for (attr in required_nodematch_attrs) {
-  vals <- nodes_df[[attr]][non_placeholder]
-  if (any(is.na(vals) | vals == "")) {
-    missing_attr <- c(missing_attr, attr)
-  }
-}
-for (attr in required_numeric_attrs) {
-  if (any(is.na(nodes_df[[attr]][non_placeholder]))) {
-    missing_attr <- c(missing_attr, attr)
-  }
-}
-if (length(missing_attr) > 0) {
-  missing_attr <- sort(unique(missing_attr))
-  stop(paste0("Missing required node attributes (no auto-fill allowed): ", paste(missing_attr, collapse = ", ")))
-}
-
+# Final vertex name setup for igraph
 nodes_df$name <- nodes_df$mbid
 if (any(is.na(nodes_df$name) | nodes_df$name == "")) {
   stop("nodes have missing vertex names after augmentation; no auto-fill allowed")
 }
-
-# Final dedupe on name to avoid igraph duplicate-name error
 nodes_df <- nodes_df %>% distinct(name, .keep_all = TRUE)
-# Ensure name is the first column for igraph and character type
 nodes_df$name <- as.character(nodes_df$name)
 nodes_df <- nodes_df %>% select(name, everything())
 
 log_step(sprintf("Total vertices after augmenting: %s", nrow(nodes_df)))
 
-# ---------------- graph prep ----------------
 log_step("Building igraph object")
 g <- graph_from_data_frame(
   d = edges_df[, c("u", "v")],
@@ -261,82 +212,70 @@ g <- graph_from_data_frame(
   vertices = nodes_df
 )
 g <- simplify(g, remove.loops = TRUE, remove.multiple = TRUE)
-V(g)$id <- V(g)$name  # explicit id attribute for network
+V(g)$id <- V(g)$name
 
 log_step("Converting to statnet network")
 net <- intergraph::asNetwork(g)
 
-# ---------------- ERGM ladder ----------------
-# Base terms
-structural_terms <- c(
-  "edges",
-  "gwesp(0.5, fixed = TRUE)",
-  "gwdegree(0.8, fixed = TRUE)"
-)
+# ---------------- model loading ----------------
+model_names <- c("m0_density", "m1_structure", "m2_homophily", "m3_exposure", "m4_weak_ties")
+models <- list()
 
-# Model 0: density only
-m0_terms <- c("edges")
-m0_formula <- ergm_formula_from_terms(m0_terms)
-m0 <- safe_fit(
-  name = "m0_density",
-  formula = m0_formula,
-  net = net,
-  results_dir = results_dir,
-)
-
-# Model 1: structural closure + degree
-m1_formula <- ergm_formula_from_terms(structural_terms)
-m1 <- safe_fit(
-  name = "m1_structure",
-  formula = m1_formula,
-  net = net,
-  results_dir = results_dir
-)
-
-# Model 2: add homophily terms
-m2_terms <- structural_terms
-for (attr in required_nodematch_attrs) {
-  m2_terms <- c(m2_terms, sprintf('nodematch("%s")', attr))
+for (name in model_names) {
+  model_path <- file.path(results_dir, paste0(name, ".rds"))
+  if (!file.exists(model_path)) {
+    log_step(paste("Model not found, skipping:", model_path))
+    next
+  }
+  log_step(paste("Loading model:", model_path))
+  models[[name]] <- readRDS(model_path)
 }
-m2_formula <- ergm_formula_from_terms(m2_terms)
-m2 <- safe_fit(
-  name = "m2_homophily",
-  formula = m2_formula,
-  net = net,
-  results_dir = results_dir
-)
 
-# Model 3: add opportunity/exposure controls
-exposure_covs <- c("collab_count_std", "num_songs_std")
-m3_terms <- structural_terms
-for (attr in exposure_covs) {
-  m3_terms <- c(m3_terms, sprintf('nodecov("%s")', attr))
+# ---------------- diagnostics ----------------
+for (name in names(models)) {
+  model <- models[[name]]
+  log_step(paste("Diagnostics for", name))
+
+  # MCMC diagnostics (only for MCMLE fits).
+  if (run_mcmc_diagnostics) {
+    diag_path <- file.path(diag_dir, paste0(name, "_mcmc_diagnostics.png"))
+    tryCatch({
+      if (refit_mcmle_for_mcmc) {
+        log_step(paste("Refitting", name, "with MCMLE for MCMC diagnostics"))
+        model_mcmc <- update(model, estimate = "MCMLE", control = mcmle_control)
+      } else {
+        model_mcmc <- model
+      }
+
+      png(diag_path, width = 1200, height = 900)
+      mcmc.diagnostics(model_mcmc)
+      dev.off()
+      saveRDS(model_mcmc, file.path(diag_dir, paste0(name, "_mcmle_refit.rds")))
+      log_step(paste("Saved MCMC diagnostics plot:", diag_path))
+    }, error = function(e) {
+      log_error(paste("MCMC diagnostics failed for", name, ":", conditionMessage(e)), log_path)
+    })
+  }
+
+  # Simulation-based goodness of fit
+  if (run_gof) {
+    gof_path <- file.path(diag_dir, paste0(name, "_gof.rds"))
+    gof_plot_path <- file.path(diag_dir, paste0(name, "_gof.png"))
+    tryCatch({
+      gof_fit <- gof(
+        model,
+        GOF = gof_formula,
+        control = control.gof.ergm(nsim = gof_nsim)
+      )
+      saveRDS(gof_fit, gof_path)
+      png(gof_plot_path, width = 1200, height = 900)
+      plot(gof_fit)
+      dev.off()
+      log_step(paste("Saved GOF results:", gof_path))
+    }, error = function(e) {
+      log_error(paste("GOF failed for", name, ":", conditionMessage(e)), log_path)
+    })
+  }
 }
-m3_formula <- ergm_formula_from_terms(m3_terms)
-m3 <- safe_fit(
-  name = "m3_exposure",
-  formula = m3_formula,
-  net = net,
-  results_dir = results_dir
-)
 
-# Model 4: add weak-tie structural signal (open two-paths)
-m4_terms <- c(structural_terms, "gwdsp(0.5, fixed = TRUE)")
-m4_formula <- ergm_formula_from_terms(m4_terms)
-m4 <- safe_fit(
-  name = "m4_weak_ties",
-  formula = m4_formula,
-  net = net,
-  results_dir = results_dir
-)
-
-# Track which models succeeded for downstream use
-model_status <- data.frame(
-  model = c("m0_density", "m1_structure", "m2_homophily", "m3_exposure", "m4_weak_ties"),
-  success = c(!is.null(m0$model), !is.null(m1$model), !is.null(m2$model), !is.null(m3$model), !is.null(m4$model)),
-  stringsAsFactors = FALSE
-)
-write.csv(model_status, file.path(results_dir, "model_status.csv"), row.names = FALSE)
-log_step("Saved model_status.csv")
-
-log_step("Done.")
+log_step("Diagnostics complete.")
