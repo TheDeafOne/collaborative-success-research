@@ -28,8 +28,6 @@ ensure_dir <- function(path) {
   path
 }
 
-has_vertex_attr <- function(g, attr) attr %in% vertex_attr_names(g)
-
 # ---------------- config ----------------
 # Keep in sync with ergm_new_features.R sampling to avoid mismatched diagnostics.
 sample_graph <- TRUE
@@ -39,17 +37,20 @@ sample_seed <- 42
 # Diagnostics toggles.
 run_gof <- TRUE
 run_mcmc_diagnostics <- TRUE
-refit_mcmle_for_mcmc <- FALSE  # set TRUE if you want MCMC diagnostics on MCMLE fits
+refit_mcmle_for_mcmc <- TRUE  # refit with MCMLE to enable MCMC diagnostics
 
 # GOF configuration (reduce nsim for speed on large graphs).
 gof_nsim <- 50
 gof_formula <- ~degree + espartners + dspartners
+gof_allow_large <- FALSE
+gof_max_nodes <- 20000
+gof_max_edges <- 500000
 
 # MCMLE configuration (only used if refit_mcmle_for_mcmc = TRUE).
 mcmle_control <- control.ergm(
   MCMC.interval = 1024,
   MCMC.samplesize = 4096,
-  MCMLE.maxit = 20
+  MCMLE.maxit = 20,
 )
 
 # Attributes used in ERGM terms (for NA cleanup, same as fitting script).
@@ -216,6 +217,14 @@ V(g)$id <- V(g)$name
 
 log_step("Converting to statnet network")
 net <- intergraph::asNetwork(g)
+if (run_gof && !gof_allow_large) {
+  if (vcount(g) > gof_max_nodes || ecount(g) > gof_max_edges) {
+    stop(paste0(
+      "GOF on full graph is too large (nodes=", vcount(g),
+      ", edges=", ecount(g), "). Enable sampling or set gof_allow_large=TRUE."
+    ))
+  }
+}
 
 # ---------------- model loading ----------------
 model_names <- c("m0_density", "m1_structure", "m2_homophily", "m3_exposure", "m4_weak_ties")
@@ -240,12 +249,8 @@ for (name in names(models)) {
   if (run_mcmc_diagnostics) {
     diag_path <- file.path(diag_dir, paste0(name, "_mcmc_diagnostics.png"))
     tryCatch({
-      if (refit_mcmle_for_mcmc) {
-        log_step(paste("Refitting", name, "with MCMLE for MCMC diagnostics"))
-        model_mcmc <- update(model, estimate = "MCMLE", control = mcmle_control)
-      } else {
-        model_mcmc <- model
-      }
+      log_step(paste("Refitting", name, "with MCMLE for MCMC diagnostics"))
+      model_mcmc <- update(model, estimate = "MCMLE", control = mcmle_control)
 
       png(diag_path, width = 1200, height = 900)
       mcmc.diagnostics(model_mcmc)
