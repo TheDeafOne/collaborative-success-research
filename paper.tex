@@ -1,0 +1,658 @@
+\documentclass[fleqn,10pt]{wlscirep}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{url}
+
+
+% Red comment macro for reviewer-style notes
+\newcommand{\rev}[1]{\textcolor{red}{\textbf{[COMMENT: #1]}}}
+
+\title{Predicting Musician Success from Early Career Collaboration Structures}
+
+\author{Keegan Woodburn}
+\author{Caleb Frey}
+\author{Ian McCulloh}
+\affil{Department of Computer Science, Johns Hopkins University, Baltimore, Maryland, USA}
+
+\affil{kwoodbu1@jhu.edu}
+\affil{frey7@jhu.edu}
+\affil{imccull4@jhu}
+
+\keywords{network science, ERGM, music industry, collaboration networks, predictive modeling}
+
+\begin{abstract}
+This work investigates whether early-career collaboration structures among musicians can predict long-term artistic success. Using MusicBrainz and Spotify data, we construct a large-scale collaboration network and model the generative processes underlying tie formation using Exponential Random Graph Models (ERGMs). We show that structural tendencies such as triadic closure, homophily, and productivity-driven exposure shape early collaboration, while weak ties are underrepresented relative to structural expectations. Using these insights, we engineer interpretable features and learned graph embeddings to predict long-term success, measured by Spotify follower count. Our findings demonstrate that early-network connectivity---particularly weak ties, cross-community bridging, and deviations from expected structural patterns---substantially improves predictive accuracy over baselines.
+\end{abstract}
+
+\begin{document}
+
+\flushbottom
+\maketitle
+\thispagestyle{empty}
+
+\section*{Introduction}
+The modern music industry is built on collaborative nepotism. Songwriters, producers, performers, and composers work together across shifting creative teams, forming dense, interconnected networks that shape both artistic output and commercial opportunity. While prior research has examined musical success through audio features, social media activity, or individual-level traits such as track count and genre \cite{McVicar2011HitSongScience, Zangerle2019HitSongPrediction, Choudhary2021Multimodal}, far less attention has been given to the relational structure in which artists operate. Yet social theory and empirical research across creative industries suggest that who an artist collaborates with, and how those collaborations position them within the broader creative ecosystem, may be as consequential as their intrinsic talent or stylistic choices \cite{Granovetter1973WeakTies, Burt1992StructuralHoles}.
+
+This project investigates the role of early-career collaboration networks in predicting long-term artistic success. Drawing inspiration from extensive literature on social capital and network advantage, we treat collaborative relationships not merely as metadata but as meaningful traces of information flow, opportunity access, and community structure. These considerations motivate three primary research questions:
+\begin{enumerate}[label=RQ\arabic*:,leftmargin=4em,labelsep=0.5em]
+    \item What structural mechanisms shape the formation of early-career collaboration networks?
+    \item Do early-career network positions predict long-term success in the music industry?
+    \item Which dimensions of network structure hold the strongest predictive value?
+\end{enumerate}
+
+Our central premise is that connectivity is an early signal of success: an artist’s collaborations in the first years of their career encode structural properties that can be quantified, modeled, and used to forecast their future commercial trajectory.
+
+We construct a large-scale collaboration network using data from MusicBrainz and Spotify \cite{MusicBrainz, SpotifyAPI}, capturing 1.4 million creative ties among 240 thousand artists. We use Exponential Random Graph Models (ERGMs) to identify the generative forces shaping this network---including triadic closure, homophily, productivity-driven exposure, and weak-tie bridging---drawing on established statistical network modeling frameworks \cite{Robins2007IntroERGM}. These mechanisms provide a theory-aligned basis for designing node-level features that reflect how each artist participates in, deviates from, or capitalizes on these structural tendencies.
+
+Building on this foundation, we develop a predictive modeling framework which combines traditional network metrics, ERGM-informed features, and learned graph embeddings to estimate long-term success, measured by Spotify follower count as of 2025.
+
+Crucially, all features are derived only from the first five years of an artist’s career, reflecting the perspective of an investor or talent scout who must evaluate artists long before mainstream recognition. Our results show that early-career network structure---particularly weak ties, cross-community connectivity, and deviations from expected structural patterns---substantially improves predictive accuracy over baseline models.
+
+Overall, this work provides both conceptual and practical contributions. It offers evidence that early-career collaboration networks encode measurable signals of later artistic success, clarifies which structural dimensions matter most, and introduces a scalable, data-driven framework for forecasting long-term outcomes for emerging musicians. In doing so, it demonstrates how network-based methods can be used to study creative career trajectories and clarifies the role of early social structures in shaping long-term artistic development.
+
+\subsection*{Background and Related Work}
+
+Understanding artistic success has long been a central question in music information research. Early work emphasized audio content, lyrics, and multimodal signals as predictors of commercial performance. Surveys such as Choudhary and Rao \cite{Choudhary2021Multimodal} catalog approaches spanning acoustic features, user engagement signals, and metadata-driven models. Foundational efforts in ``hit song science'' \cite{McVicar2011HitSongScience} and later studies incorporating high- and low-level acoustic descriptors \cite{Zangerle2019HitSongPrediction} illustrate the predictive potential of content-based methods, while lyric-focused pipelines \cite{Xue2014LyricsSuccess} offer complementary perspectives.
+
+More recent research examines collaboration networks as determinants of musical success. Kang \emph{et al.} \cite{Kang2022Musicians} show that the structural properties of collaboration graphs, including degree, clustering, and community structure, are strongly associated with commercial outcomes. A series of studies by Silva, Oliveira, and collaborators investigate how collaboration patterns emerge and how they relate to popularity across genres and time \cite{Silva2019SAC,Oliveira2020ISMIR,Oliveira2021Thesis}, finding that homophily, role similarity, and recurrent partnerships shape team formation, while bridging interactions provide distinct advantages in exposure. Silva and Moro \cite{Silva2019WebMedia} further use causal analysis to assess whether collaboration structure drives or merely reflects artistic success. Empirical work in management research similarly finds that collaboration strategies affect long-term commercial trajectories \cite{MartinezAlbeniz2023MusicIndustry}.
+
+These findings align with foundational social network theory. Granovetter's theory of weak ties highlights the importance of sparse, cross-community connections for accessing diverse audiences and novel opportunities \cite{Granovetter1973WeakTies}, while Burt's structural holes framework emphasizes the advantages of brokerage positions that bridge otherwise disconnected groups \cite{Burt1992StructuralHoles}. Together, these perspectives underscore that artistic careers are shaped by the relational environments in which creative work occurs.
+
+Across these efforts, a consistent theme emerges: artist success cannot be understood independently of the collaboration structures in which careers develop. However, prior work has not simultaneously modeled the generative processes underlying collaboration formation and evaluated long-term predictive performance using early-career networks at scale. This study fills that gap by integrating large-scale collaboration data, ERGM-based modeling of tie formation, and predictive machine learning to assess whether early-career network structure offers measurable foresight into long-term artistic success.
+
+\section*{Results}
+
+We organize the Results section around the three research questions introduced earlier. We first present results from the statistical network modeling analysis that addresses RQ1 by identifying the mechanisms shaping early-career collaboration networks. We then turn to predictive modeling results addressing RQ2, followed by an analysis of feature importance and structural dimensions relevant to RQ3.
+\subsection*{RQ1: Mechanisms of Early-Career Collaboration Formation}
+
+To address RQ1, we fit a sequence of Exponential Random Graph Models (ERGMs) to the early-career collaboration network to identify the structural mechanisms governing tie formation. Across specifications, collaboration patterns deviate strongly from random mixing and reflect systematic dependence on local network structure, selective assortativity, and opportunity-related exposure.
+
+Across all models, triadic closure effects are positive. The inclusion of \texttt{gwesp} terms substantially improves model fit relative to a baseline density model, indicating that collaboration ties are significantly more likely to form among artists who already share common collaborators. These effects remain stable across specifications that incorporate attribute-based matching and opportunity controls, indicating that clustering is a robust feature of early-career collaboration networks.
+
+Evidence for attribute-based assortativity is more selective. Once endogenous network structure is accounted for, country matching is associated with a higher likelihood of collaboration, whereas matching on genre, label affiliation, and role exhibits weak or negative associations. This pattern indicates that observed similarity among collaborators is not uniformly attributable to direct preference for similar partners and may instead reflect shared network neighborhoods.
+
+Opportunity and exposure covariates further condition tie formation. Higher collaboration frequency is associated with increased tie propensity, whereas cumulative production output alone is not. These effects indicate that repeated collaborative activity is more strongly associated with future tie formation than total volume of credited work.
+
+Finally, models incorporating weak-tie structure show that open shared-partner configurations are underrepresented relative to structural expectations. The negative \texttt{gwdsp} effect indicates that bridging configurations occur less frequently than would be expected under comparable structural conditions.
+
+Together, these results characterize the principal generative mechanisms of early-career collaboration networks and motivate the construction of network-based features used in subsequent predictive analyses.
+
+
+\subsection*{RQ2: Predictive Performance Across Feature Sets}
+
+We next evaluate whether early-career network position predicts long-term artistic success. We split the data into a training set and held-out test set (80\% / 20\%). All hyperparameter tuning and model selection were performed exclusively on the training set to avoid test-set leakage.
+
+Specifically, we tuned CatBoost hyperparameters using 5-fold cross-validation (CV) on the training set. The selected hyperparameters were a learning rate of 0.05, $\ell_2$ leaf regularization of 5, a maximum of 1000 iterations, depth of 8, and a bagging temperature of 0.5. Using these fixed hyperparameters, we compared feature-group configurations via 5-fold CV on the training set. Table~\ref{tab:cv_results} reports the mean and standard deviation of log-RMSE and log-$R^2$ across the five training folds; best values for each metric across feature sets are shown in bold.
+
+\begin{table}[htbp]
+\centering
+\caption{Five-fold cross-validated performance on the \emph{training} set for CatBoost models across feature sets (hyperparameters tuned on the training set).}
+\label{tab:cv_results}
+\begin{tabular}{lcccc}
+\hline
+\multirow{2}{*}{Feature set} & \multicolumn{2}{c}{log-RMSE} & \multicolumn{2}{c}{log-$R^2$} \\
+ & mean & std & mean & std \\
+\hline
+base+graph+n2v & \textbf{2.391} & 0.014 & \textbf{0.417} & 0.008 \\
+base+graph     & 2.451         & 0.012 & 0.388          & 0.005 \\
+base+n2v       & 2.423         & 0.012 & 0.402          & 0.008 \\
+graph+n2v      & 2.562         & 0.013 & 0.331          & 0.007 \\
+base           & 2.563         & 0.012 & 0.331          & 0.004 \\
+graph          & 2.704         & 0.011 & 0.255          & 0.006 \\
+n2v            & 2.661         & 0.011 & 0.279          & 0.007 \\
+\hline
+\end{tabular}
+\end{table}
+
+
+The \texttt{base} model, which uses only early-career metadata, achieves a mean CV log-RMSE of 2.56 and mean CV log-$R^2$ of 0.33, indicating that non-network attributes already explain a substantial fraction of variance in long-term follower counts. Adding hand-engineered network statistics (\texttt{base+graph}) yields a clear improvement, reducing mean CV log-RMSE by approximately 4.5\% and increasing mean CV explained variance by about 18\%. This demonstrates that early-career collaboration structure provides predictive signal beyond traditional artist attributes.
+
+The strongest performance is achieved by the full \texttt{base+graph+n2v} model, which combines metadata, network statistics, and node2vec embeddings. Relative to the \texttt{base}-only baseline, this model reduces mean CV log-RMSE by 6.5\% and increases mean CV log-$R^2$ from 0.33 to 0.42, corresponding to an improvement of approximately 25\% in explained variance.
+
+Models relying solely on network features or embeddings perform worse than the metadata baseline, indicating that network structure alone is insufficient. However, combining network statistics and embeddings improves performance over either representation in isolation, highlighting their complementary nature.
+
+Finally, to assess generalization, we trained a \texttt{base+graph+n2v} CatBoost model on the full training set using the selected hyperparameters and evaluated it once on the untouched 20\% test set. On the test set, the model achieves a log-RMSE of 2.38 and a log-$R^2$ of 0.42. Because the test set is evaluated only once, we report single-point test metrics rather than a cross-validated mean and standard deviation. The close agreement between the training CV estimates and the held-out test performance indicates that the observed gains are not driven by overfitting and generalize to unseen artists. These results provide strong evidence that early-career network position is predictive of long-term success, directly answering RQ2.
+
+
+\subsection*{RQ3: Feature Importance and Structural Dimensions of Success}
+
+To understand which aspects of early-career information drive predictive performance, we analyze feature importance for the full \texttt{base+graph+n2v} model, addressing RQ3. Table~\ref{tab:feature_importance} reports the fifteen most important predictors according to CatBoost's feature importance measure.
+
+\begin{table}[t]
+\centering
+\caption{Top fifteen features by CatBoost feature importance for the full \texttt{base+graph+n2v} model.}
+\label{tab:feature_importance}
+\begin{tabular}{lc}
+\hline
+Feature & Importance \\
+\hline
+artist\_country      & 8.45 \\
+artist\_region\_city & 6.81 \\
+primary\_role        & 6.02 \\
+primary\_label       & 5.05 \\
+years\_active        & 4.82 \\
+n2v\_2               & 4.32 \\
+betweenness          & 3.61 \\
+n2v\_10              & 3.02 \\
+n2v\_9               & 2.82 \\
+n2v\_5               & 2.81 \\
+n2v\_8               & 2.46 \\
+n2v\_14              & 2.26 \\
+collab\_track\_rate  & 2.24 \\
+n2v\_13              & 2.03 \\
+n2v\_7               & 2.03 \\
+\hline
+\end{tabular}
+\end{table}
+
+The importance rankings reveal a combination of geographic, organizational, and network-derived predictors. While location, role, label affiliation, and career duration are among the strongest drivers, network features also play a central role. Betweenness centrality emerges as the most influential explicit structural metric, consistent with theories emphasizing brokerage and cross-community connectivity. Multiple node2vec dimensions also rank highly, indicating that higher-order structural patterns and community embedding contribute meaningfully to long-term success.
+
+We further examine model behavior using SHAP values, summarized in Figure~\ref{fig:shap}. The SHAP analysis corroborates the global importance rankings and highlights additional network-related features, such as \texttt{gwesp\_score} and \texttt{community\_participation}. Together, these results show that long-term success is associated with a combination of brokerage positions, cross-community engagement, and deviations from expected collaboration patterns.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/shap.png}
+    \caption{SHAP summary plot for the full \texttt{base+graph+n2v} CatBoost model, showing the relative contribution of the most influential features to predicted follower counts. Grey points indicate a categorical variable.}
+    \label{fig:shap}
+\end{figure}
+
+
+\section*{Discussion}
+
+This study examined whether early-career collaboration networks encode predictive signals of long-term musical success and which structural features are most informative. We focused on three questions: (1) the mechanisms governing early-career tie formation, (2) the predictive value of early-career network position, and (3) which structural dimensions matter most for downstream outcomes. Here, we synthesize the results, discuss their implications, and outline key limitations.
+
+\subsection*{From Collaborative Nepotism to Structured Advantage}
+
+The introduction characterized the contemporary music industry as operating through a form of ``collaborative nepotism,'' in which opportunities circulate within dense, overlapping teams rather than emerging through open, exploratory partner search. The network formation results formalize this intuition. The dominance of triadic closure indicates that early-career collaborations arise primarily within tightly connected local neighborhoods rather than through structurally novel partnerships. New ties are therefore embedded in existing collaboration contexts, reinforcing cohesive team structures over time.
+
+Attribute-based similarity plays a more constrained role than simple homophily accounts would suggest. While geographic matching remains an important organizing principle, other dimensions of similarity---such as genre, label, and role---do not systematically promote collaboration once endogenous clustering and degree heterogeneity are taken into account. This pattern suggests that much observed similarity among collaborators may arise from shared structural environments rather than direct assortative preferences.
+
+Opportunity-related covariates further indicate that repeated collaborative exposure, rather than cumulative output alone, shapes tie formation. Artists who collaborate frequently are embedded in broader opportunity sets and attract additional ties, consistent with cumulative advantage processes operating through visibility and relational access.
+
+Finally, the relative absence of weak ties has important implications. Rather than exhibiting a network rich in brokerage and boundary-spanning connections, early-career collaboration structures are dominated by overlapping and redundant neighborhoods. The underrepresentation of bridging configurations suggests that early careers are shaped more by cohesion and repeated local interaction than by structural exploration across distant communities.
+
+Together, these findings recast early-career collaboration not as a search process over a wide opportunity landscape, but as a structurally constrained system in which access and advantage are reproduced within cohesive local networks. This structural environment provides the context in which early network position can plausibly shape long-term career trajectories, motivating the predictive analyses that follow.
+
+\subsection*{Predictive Value of Early-Career Connectivity}
+
+Our predictive results show that early-career connectivity adds measurable signal beyond non-network features. Models using only base attributes such as activity cadence, labels, roles, geography, and tenure, explain a substantial fraction of variance in log follower counts. Adding engineered graph statistics and node2vec embeddings yields consistent performance gains, with the full \texttt{base+graph+n2v} model achieving the best log-RMSE and log-$R^2$.
+
+This improvement is not driven by a single measure, instead leveraging a combination of brokerage, community placement, and higher-order proximity captured by network features and embeddings. Feature-importance analysis highlights betweenness centrality as a key predictor, consistent with the idea that artists on shortest paths between otherwise weakly connected regions can broker practices and audiences. Several node2vec dimensions also appear among the most important features, indicating that more latent aspects of network structure are important.
+
+\subsection*{Implications for Talent Discovery and Artist Development}
+
+From the perspective of investors, label A\&R teams, or talent scouts, our framework shows that early-career collaboration data contain useful information about an artist’s future trajectory, using only the first five years of recorded activity. In practical terms:
+
+\begin{itemize}
+    \item Traditional signals such as release volume, label affiliation, geography, and tenure are informative but incomplete. Network-aware models provide additional, orthogonal signal.
+    \item Artists embedded in dense local clusters with no signs of brokerage may be less likely to reach audiences beyond their immediate scenes, even if they are prolific.
+    \item Artists who occupy bridging positions or whose embeddings place them near multiple communities may represent high-upside opportunities.
+\end{itemize}
+
+\subsection*{Limitations}
+
+Several limitations qualify our findings:
+\begin{enumerate}
+    \item We define early career as the first five years of observed MusicBrainz activity. This is a major simplification of actual career stages, especially for artists active in informal or uncredited contexts before appearing in the database or for those with atypical ramp-up periods.
+    \item The collaboration network is limited to credits and roles recorded in MusicBrainz. Uncredited work, informal collaborations, and off-platform relationships are not observed. Errors in entity resolution between MusicBrainz and Spotify and noisy or missing metadata (genre, label, location) may have introduced additional measurement error.
+    \item ERGMs provide a generative description but not causal estimates of tie-formation processes, especially at this scale where model simplifications are required. Likewise, the regression models are predictive rather than causal: changes in network position cannot be interpreted as causing changes in future follower counts. Unobserved factors such as promotion budgets, resources, or prior reputation likely affect both network structure and eventual success.
+    \item Although the full model explains a meaningful portion of variance in log followers, most variation remains unexplained. Talent, timing, genre cycles, recommendation algorithms, and broader cultural dynamics all play roles that are difficult to capture using early-career collaboration data alone.
+
+\end{enumerate}
+% \end{enumerate}First,  Second, Third, ERGMs provide a generative description but not causal estimates of tie-formation processes, especially at this scale where model simplifications are required. Likewise, the regression models are predictive rather than causal: changes in network position cannot be interpreted as causing changes in future follower counts. Unobserved factors such as promotion budgets, resources, or prior reputation likely affect both network structure and eventual success.
+
+% Finally, although the full model explains a meaningful portion of variance in log followers, most variation remains unexplained. Talent, timing, genre cycles, recommendation algorithms, and broader cultural dynamics all play roles that are difficult to capture using early-career collaboration data alone.
+
+
+\subsection*{Future Directions}
+
+Several extensions follow naturally from this work. First, moving from static early-career snapshots to dynamic models could clarify how changes in collaboration structure relate to changes in success. Temporal ERGMs, event-history models, or sequence models could track how the formation of new bridges or dissolution of old ties correlates with subsequent growth in popularity.
+
+Second, integrating additional data modalities (audio features, lyrics, social-media trajectories, and touring histories) could provide a more complete view of how creative output, attention, and collaboration interact.
+
+Third, richer network representations such as multilayer networks could distinguish among collaboration types (e.g., live versus studio work), and graph neural networks could learn task-specific structural representations that complement our engineered features and node2vec embeddings.
+
+In sum, our findings support the core premise articulated in the introduction: nepotism, understood as dense and homophilous collaboration patterns, is a central feature of the music industry’s early-career networks. Within this environment, rare but structurally distinct bridging ties and brokerage positions carry disproportionate predictive value for which artists reach larger audiences. Understanding these patterns provides a network-based lens on how creative careers develop and which forms of connectivity are most closely linked to long-term success.
+
+\section*{Methods}
+
+\subsection*{Data and Network Construction}
+\subsubsection*{Data Sources}
+Our analysis integrates two data sources. Collaboration data are drawn from MusicBrainz, a community-maintained database that provides detailed information on musical works, recordings, releases, contributor roles, and genre tags \cite{MusicBrainz}. To assess long-term career success, we link MusicBrainz artists to their corresponding Spotify profiles and extract each artist’s current follower count. We collected data from both of these sources in December 2025. 
+
+\subsubsection*{Identifying the Early-Career Window}
+To examine whether early collaboration structure predicts long-term success, we focus on each artist’s first five years of professional activity. We identify an artist’s debut date as their earliest observable appearance on a MusicBrainz work or recording, and define the early-career period as the subsequent five-year window. For artists with less than five years in their career, we use all years available. This provides a simple approximation of an artist’s early career.
+
+We begin we constructing the network by getting the ids of all 2.7 million artists available in the MusicBrainz database. Because our predictive task requires a success metric, we restrict our sample to artists who have a valid Spotify identifier and therefore a measurable follower count \cite{SpotifyAPI}. This reduces the total number of musicians we analyze to 352,197. This ensures that all included artists have observable long-term outcomes. We further retain only those artists who have participated in at least one collaborative work during their first five years, since collaboration is the basis for constructing the network that follows, resulting in 86,762 total artists. Together, these criteria yield a quality, collaboration-relevant population with well-defined early-career periods and consistent success measurements.
+
+\subsubsection*{Artist--Song Bipartite Graph}
+Using the filtered set of artists and their early-career works, we construct a bipartite graph linking artists to songs. An edge is created whenever an artist is credited on a work, regardless of contribution type: writing, producing, performing, engineering, or any other recognized creative role. This inclusive definition captures the full breadth of collaborative relationships reflected in musical production. Note that if an artist is listed as a collaborator on a work, but does not exist in our previously described set of filtered artists, we still include them in this bipartite graph. We do this in order to capture the full collaboration network in the next step.
+
+\subsubsection*{Projected Artist Collaboration Network}
+We derive an undirected artist collaboration graph by projecting the bipartite network onto the artist layer. Two artists are connected by an edge if they are credited on the same work at least once. This yields an undirected graph in which nodes represent individual artists and edges represent collaborative ties formed during the first five years of their careers. Because all collaboration types are included, the network reflects a comprehensive view of early creative interactions across songwriting, performance, and production contexts.
+
+\subsubsection*{Network Statistics}
+The resulting artist–artist network contains 243,233 artists connected by 1.43 million collaborative ties, forming a sparse but globally cohesive structure (density = $4.8 \times 10^{-5}$). The node count exceeds the size of our initially filtered artist cohort because we retain all credited collaborators on early-career works even if those collaborators were excluded from the prediction cohort. Many such contributors (e.g., producers, writers, engineers, or session performers) are credited on recordings but do not appear as “main artists” with associated release catalogs in MusicBrainz, and therefore fail our initial filters. Including them ensures the projected collaboration graph reflects the full set of early-career collaboration relationships rather than an artificially truncated network. 
+
+Despite the low density typical of large creative networks, 92\% of artists fall within a single component (223,031 nodes), with a diameter of 19, indicating relatively short collaborative distances even across stylistically distant communities. The degree distribution follows the heavy-tailed pattern typical of collaboration systems: most artists work with only a handful of partners, while a small minority accumulate hundreds or even thousands of ties. There is also notable local cohesion, with the global clustering coefficient (0.045) indicating far more closed triads than expected under a comparable random graph. Together, these patterns point to collaboration dynamics shaped by opportunity structures, homophily, and reinforcement through repeated or densely connected teams --- mechanisms we examine more formally in the following ERGM analysis.
+
+\subsection*{Network Formation Modeling}
+To understand the generative processes underlying early-career collaboration, we estimate a sequence of Exponential Random Graph Models (ERGMs) on the artist--to--artist network. ERGMs allow us to express the probability of an observed collaboration structure $Y = y$ as a function of interpretable local configurations such as triangles, degree distributions, attribute similarities, and opportunity structures, with each representing a theoretically meaningful mechanism of tie formation \cite{Robins2007IntroERGM}. The standard equation for ERGMs is:
+\begin{equation}
+\Pr(Y = y) \propto 
+\exp\left\{
+    \sum_{k} \theta_k \, g_k(y)
+\right\},
+\label{eq:ergm-general-intext}
+\end{equation}
+where $g_k(y)$ denotes a network statistic (e.g., number of edges, triangles, or homophilous ties) and $\theta_k$ is the corresponding parameter that captures the strength and direction of that effect \cite{Robins2007IntroERGM}.
+
+\paragraph*{Interpretation of ERGM parameters.}
+All ERGM coefficients are interpreted as log-odds changes in the probability of a tie associated with a one-unit increase in the corresponding network statistic, conditional on all other terms in the model. For dyad-independent terms (e.g., \texttt{edges}, \texttt{nodematch}, \texttt{nodecov}), this corresponds directly to the change in log-odds of a tie for a focal dyad. For endogenous structural terms (e.g., \texttt{gwesp}, \texttt{gwdegree}, \texttt{gwdsp}), the coefficient reflects the average change in log-odds associated with the addition of locally defined configurations, as summarized by the term’s change statistic \cite{Robins2007IntroERGM}.
+
+Coefficients may be exponentiated to yield odds ratios, with $\exp(\theta)>1$ indicating increased odds of tie formation and $\exp(\theta)<1$ indicating suppression of ties, holding other terms constant. Because curved ERGM terms aggregate over many potential configurations, even small coefficients can correspond to substantively large effects at scale.
+
+\paragraph*{Estimation, reproducibility, and model checks.}
+All ERGMs were fit using the R programming language, with the \texttt{statnet}/\texttt{ergm} packages (v2019.6 and v4.10.1 respectively). Because the full artist-artist network is extremely large (29 billion dyads), we estimate each specification using maximum pseudolikelihood estimation (MPLE). MPLE scales to large networks by fitting the dyadwise logistic pseudolikelihood rather than requiring repeated MCMC simulation of full networks during estimation.
+
+Standard ERGM diagnostics such as MCMC trace plots and simulation-based goodness-of-fit are typically performed under MCMC-MLE, but are computationally infeasible for networks of this size because they require simulating many full networks and computing high-dimensional summaries (exceeding reasonable memory/compute). Accordingly, we assess model adequacy using diagnostics that are well-defined under MPLE at scale: (i) nested model comparison using deviance and information criteria (AIC/BIC); (ii) parameter stability across the model ladder, especially for shared structural terms; and (iii) checks for numerical pathologies (finite coefficient estimates and standard errors, and absence of separation or degenerate fitted probabilities). These checks support the qualitative conclusions below while making clear the scope and limitations of inference under MPLE for large graphs.
+
+\subsubsection*{Model Ladder}
+
+\paragraph*{Model 1: Baseline Density}
+The baseline model includes only an edges term, capturing the overall propensity for ties in the network:
+\begin{equation}
+\Pr(Y = y) \propto 
+\exp\left\{
+    \theta_{\text{edges}} \cdot \text{edges}(y)
+\right\},
+\label{eq:model0-intext}
+\end{equation}
+where $\text{edges}(y)$ is the total number of artist--artist collaboration ties in the observed network $y$, and $\theta_{\text{edges}}$ is the corresponding log-odds parameter for tie formation under structural independence.
+
+This model provides a null log-odds of tie formation under complete structural independence. As expected for a sparse creative-industry network, the estimated coefficient is strongly negative ($\approx -9.9$; see Table~\ref{tab:model1}). This establishes the baseline against which all subsequent structural and attribute effects are evaluated.
+
+\begin{table}[h!]
+\centering
+\caption{Model 1 (Baseline Density) ERGM coefficients.}
+\begin{tabular}{lccc}
+\hline
+Term & Estimate & Std.\ Error & $p$-value \\
+\hline
+Edges & -9.939 & 0.001 & $< 1 \times 10^{-4}$ \\
+\hline
+\end{tabular}
+\label{tab:model1}
+\end{table}
+
+\paragraph*{Model 2: Structural Dependencies}
+To capture endogenous structure commonly documented in social and creative networks \cite{Wasserman1994SNA}, Model~2 adds two curved ERGM terms:
+\begin{itemize}
+    \item \texttt{gwesp}(0.5) to model triadic closure and the reinforcement of tightly knit teams.
+    \item \texttt{gwdegree}(0.8) to model the heavy-tailed degree distribution while preventing runaway hub formation.
+\end{itemize}
+
+Formally, Model~2 takes the form:
+\begin{equation}
+\Pr(Y = y) \propto 
+\exp\left\{
+    \theta_{\text{edges}} \cdot \text{edges}(y)
+    + \theta_{\text{gwesp}} \cdot \text{gwesp}_{0.5}(y)
+    + \theta_{\text{gwdegree}} \cdot \text{gwdegree}_{0.8}(y)
+\right\}.
+\label{eq:model1-intext}
+\end{equation}
+
+This specification tests whether the network exhibits triangle-closing, clustering tendencies beyond chance, and whether degree heterogeneity emerges from endogenous processes. Relative to Model~1, the inclusion of clustering and degree terms substantially improves fit: residual pseudo-deviance decreases from $3.122\times 10^{7}$ (Model~1) to $2.611\times 10^{7}$ (Model~2).
+
+The \texttt{gwesp} coefficient is positive as seen in Table~\ref{tab:model2}, indicating that triadic closure is a dominant force in early collaboration. The \texttt{gwdegree} term is negative, suggesting that higher-degree nodes form ties less readily once degree is accounted for, consistent with saturation or capacity constraints among prolific artists.
+
+\begin{table}[h!]
+\centering
+\caption{Model 2 (Structural Dependencies) ERGM coefficients.}
+\begin{tabular}{lccc}
+\hline
+Term & Estimate & Std.\ Error & $p$-value \\
+\hline
+Edges & -9.518 & 0.001 & $<1 \times 10^{-4}$ \\
+GWESP (0.5) & 0.890 & 0.000 & $<1 \times 10^{-4}$ \\
+GWDegree (0.8) & -3.350 & 0.005 & $<1 \times 10^{-4}$ \\
+\hline
+\end{tabular}
+\label{tab:model2}
+\end{table}
+
+Because the structural terms introduced in Model~2 appear in all subsequent specifications, we define the combined structural component as
+\[
+S(y) = 
+\theta_{\text{edges}} \cdot \text{edges}(y)
++ \theta_{\text{gwesp}} \cdot \text{gwesp}_{0.5}(y)
++ \theta_{\text{gwdegree}} \cdot \text{gwdegree}_{0.8}(y),
+\]
+and use $S(y)$ as shorthand in the remaining ERGM definitions.
+
+\paragraph*{Model 3: Homophily on Creative and Organizational Attributes}
+Model~3 introduces a set of \texttt{nodematch} terms capturing homophily on key artist attributes, a mechanism widely observed in social and organizational networks \cite{Wasserman1994SNA}:
+\begin{itemize}
+    \item \texttt{primary\_genre}
+    \item \texttt{primary\_label}
+    \item \texttt{primary\_role}
+    \item \texttt{country} and \texttt{region/city}.
+\end{itemize}
+
+This means that for the attribute set $A = \{\text{primary\_genre}, \text{primary\_label}, \text{primary\_role}, \text{country}, \text{region/city}\}$:
+\begin{equation}
+\Pr(Y = y) \propto
+\exp\left\{
+    S(y)
+    + \sum_{a \in A} 
+        \theta_{\text{match},a} \cdot \text{nodematch}_a(y)
+\right\}.
+\label{eq:model2-compact}
+\end{equation}
+
+Across attributes, the estimated matching effects quantify how shared creative, organizational, and geographic characteristics condition early collaboration, net of endogenous structural dependencies. Table~\ref{tab:model3} summarizes the estimated homophily effects alongside the shared structural terms.
+
+\begin{table}[h!]
+\centering
+\caption{Model 3 (Homophily Effects) ERGM coefficients.}
+\begin{tabular}{lccc}
+\hline
+Term & Estimate & Std.\ Error & $p$-value \\
+\hline
+Edges & -7.351 & 0.002 & $<1 \times 10^{-4}$ \\
+GWESP (0.5) & 2.523 & 0.001 & $<1 \times 10^{-4}$ \\
+GWDegree (0.8) & -6.748 & 0.008 & $<1 \times 10^{-4}$ \\
+Genre Match & -0.860 & 0.002 & $<1 \times 10^{-4}$ \\
+Label Match & -6.079 & 0.009 & $<1 \times 10^{-4}$ \\
+Role Match & -0.066 & 0.003 & $<1 \times 10^{-4}$ \\
+Country Match & 1.122 & 0.003 & $<1 \times 10^{-4}$ \\
+Region Match & -1.159 & 0.003 & $<1 \times 10^{-4}$ \\
+\hline
+\end{tabular}
+\label{tab:model3}
+\end{table}
+
+\paragraph*{Model 4: Opportunity and Exposure Controls}
+To account for differences in collaboration opportunities, Model~4 adds \texttt{nodecov} terms for artist-level productivity and exposure:
+\begin{itemize}
+    \item \texttt{nodecov(track\_count)} (z-scored total track credits),
+    \item \texttt{nodecov(collab\_count)} (z-scored collaboration frequency).
+\end{itemize}
+
+Attributes were log-transformed using $\log(1 + x)$ and standardized across all artists. The resulting model is:
+\begin{equation}
+\Pr(Y = y) \propto
+\exp\left\{
+    S(y)
+    + \theta_{\text{prod}} \cdot \text{nodecov}(\text{track\_count}) 
+    + \theta_{\text{collab}} \cdot \text{nodecov}(\text{collab\_count})
+\right\}.
+\label{eq:model3-compact}
+\end{equation}
+
+These covariates adjust for systematic heterogeneity in exposure and opportunity that may otherwise be confounded with endogenous structural effects.
+
+\begin{table}[h!]
+\centering
+\caption{Model 4 (Opportunity and Exposure Controls) ERGM coefficients.}
+\begin{tabular}{lccc}
+\hline
+Term & Estimate & Std.\ Error & $p$-value \\
+\hline
+Edges & -9.600 & 0.002 & $<1 \times 10^{-4}$ \\
+GWESP (0.5) &  2.649 & 0.001 & $<1 \times 10^{-4}$ \\
+GWDegree (0.8) & -4.545 & 0.006 & $<1 \times 10^{-4}$ \\
+Track Count (std) & -0.766 & 0.002 & $<1 \times 10^{-4}$ \\
+Collab Count (std) &  1.000 & 0.001 & $<1 \times 10^{-4}$ \\
+\hline
+\end{tabular}
+\label{tab:model4}
+\end{table}
+
+\paragraph*{Model 5: Weak-Tie Structure}
+To identify the presence of weak ties, we estimate a model incorporating \texttt{gwdsp(0.5)}, which captures sparse shared-partner configurations associated with brokerage and information diffusion \cite{Granovetter1973WeakTies}. Formally this is:
+
+\begin{equation}
+\Pr(Y = y) \propto
+\exp\left\{
+    S(y)
+    + \theta_{\text{gwdsp}} \cdot \text{gwdsp}_{0.5}(y)
+\right\}.
+\label{eq:model4-compact}
+\end{equation}
+
+
+The negative \texttt{gwdsp} estimate indicates that, conditional on strong triadic closure and degree heterogeneity, dyads embedded in open shared-partner structures occur less frequently than would be expected under otherwise comparable structural conditions. Because \texttt{gwdsp} aggregates over many potential shared-partner configurations, even small negative coefficients can correspond to systematic suppression of bridging ties at scale. Model~5 also improves overall fit relative to Model~2, with residual pseudo-deviance decreasing from $2.611\times 10^{7}$ to $1.906\times 10^{7}$.
+
+\begin{table}[h!]
+\centering
+\caption{Model 5 (Weak-Tie Structure) ERGM coefficients.}
+\begin{tabular}{lccc}
+\hline
+Term & Estimate & Std.\ Error & $p$-value \\
+\hline
+Edges & -9.223 & 0.002 & $<1 \times 10^{-4}$ \\
+GWESP (0.5) &  2.575 & 0.001 & $<1 \times 10^{-4}$ \\
+GWDSP (0.5) & -0.001 & 0.000 & $<1 \times 10^{-4}$ \\
+GWDegree (0.8) & -5.050 & 0.006 & $<1 \times 10^{-4}$ \\
+\hline
+\end{tabular}
+\label{tab:model5}
+\end{table}
+
+\subsection*{Feature Engineering}
+
+To characterize artists’ early-career positions within the collaboration network, we construct a set of features spanning non-network career attributes, structural and triadic graph statistics, homophily and bridging indicators, and learned node embeddings. Unless otherwise stated below, all features are computed on the early-career graph. Computations are performed in Python using NetworkX (v3.6) with SciPy sparse matrices (CSR) for adjacency operations, and NumPy/Pandas for data handling.
+
+\subsubsection*{Base Artist Features}
+Base features capture artistic activity, stylistic breadth, and organizational context independent of network structure.
+
+We compute total releases, release frequency, and inter-release timing. For each artist, we additionally extract primary label, primary genre, and primary role, along with diversity statistics including label count, label churn, and genre count. All categorical attributes are normalized and deduplicated.
+
+Attributes with a primary suffix are defined as the most frequently occurring value for that attribute across an artist’s releases, with ties being broken by selecting the earliest observed value. The primary label for each release is taken to be the first listed label. Label churn is defined as the number of times the primary label changes between consecutive releases.
+
+We use country and region/city to provide coarse geographic context. We also include years active, which is the only feature not constrained to the five-year observation window. Years active is computed as the difference between an artist’s debut year and the current year (2025). This feature is included as a control for career longevity, as artists with longer careers tend to accumulate more followers independent of early release behavior. 
+
+
+\subsubsection*{Structural Network Features}
+Structural features quantify each artist’s position in the collaboration network and their accessibility to influential regions of the graph. Centrality metrics are computed on the \emph{entire} early-career graph, including isolates (degree zero nodes); isolates are assigned the default values returned by the corresponding definitions (typically zero), and distances that are undefined due to disconnection are handled as described below.
+We compute:
+(i) degree and $\log(1+\text{degree})$;
+(ii) eigenvector centrality using the NetworkX power-iteration implementation (\texttt{nx.eigenvector\_centrality}) with tolerance $10^{-6}$ and a maximum of 200 iterations;
+(iii) $k$-core number via \texttt{nx.core\_number};
+(iv) betweenness centrality via \texttt{nx.betweenness\_centrality}, using normalized scores and an approximate estimator that samples $k=256$ source nodes (with a fixed random seed) to reduce computational cost on large graphs;
+(v) closeness centrality using either the NetworkX exact routine (\texttt{nx.closeness\_centrality} with \texttt{wf\_improved=True}).
+
+To summarize broader structural context, we also compute (a) the size of the connected component containing each node, and (b) the shortest-path distance to high-centrality ``hub'' nodes. Hubs are defined as the top-$K$ nodes by eigenvector centrality (we use $K=5$), and we compute each node’s minimum shortest-path distance to this hub set using a multi-source shortest-path routine. Nodes not connected to any hub have undefined distances; we encode these as $\infty$ (and, in modeling, treat them consistently as a distinct ``unreachable'' case).
+
+\subsubsection*{Triadic and Closure Features}
+Triadic features describe the extent to which an artist participates in densely interconnected collaboration teams. All triadic measures are computed on the early-career collaboration graph and treat edges as unweighted. For each artist, we compute:
+(i) triangle counts using \texttt{nx.triangles};
+(ii) open wedges (unclosed two-paths) as $\binom{\deg(i)}{2} - \text{triangles}(i)$ for $\deg(i)\ge 2$ (and 0 otherwise);
+(iii) the local clustering coefficient via \texttt{nx.clustering}; and
+(iv) a node-level analogue of GWESP based on shared-partner support for each adjacent pair:
+\begin{equation}
+\text{gwesp\_score}(i)
+= \sum_{j \in N(i)} \bigl(1 - e^{-\lambda s_{ij}}\bigr),
+\quad \lambda = 0.5,
+\end{equation}
+where $s_{ij}$ is the number of shared partners between $i$ and $j$ (i.e., the number of common neighbors). We compute all $s_{ij}$ efficiently via sparse matrix multiplication ($A^2$, where $A$ is the adjacency matrix) and accumulate the above score over incident edges.
+
+\subsubsection*{Homophily Features}
+Homophily features assess whether artists collaborate preferentially with stylistic or organizational peers. Using each artist’s categorical attributes (primary genre, primary label, and primary role), we compute for each attribute $a$:
+\begin{equation}
+\text{same\_attr\_share}_a(i)
+= \frac{1}{\deg(i)} \sum_{j \in N(i)} \mathbb{I}(a_i = a_j).
+\end{equation}
+For artists with $\deg(i)=0$, the ratio is undefined; we assign $\text{same\_attr\_share}_a(i)=0$ (no evidence of assortative mixing in the absence of collaborations), and such artists are retained in the dataset.
+
+To capture whether similarity (or dissimilarity) concentrates in closed triads, we additionally compute node-level counts of (i) within-attribute triangles (all three nodes share the same attribute value) and (ii) cross-attribute triangles (all three nodes have distinct attribute values). These counts are computed by enumerating unique triangles once (using an index-ordering scheme to avoid duplicates) and aggregating per-node counts; the within/cross tallies are computed separately for genre, label, and role.
+
+\subsubsection*{Weak-Tie and Bridging Features}
+Weak-tie and bridging features characterize access to novel neighborhoods and cross-community linkages. We define the tie between $i$ and $j$ as \emph{weak} if the pair has at most one shared partner ($s_{ij}\le 1$), where $s_{ij}$ is the common-neighbor count defined above. This threshold operationalizes the intuition that ties lacking triadic reinforcement (zero shared partners) or with minimal reinforcement (one shared partner) are more likely to bridge otherwise separated local neighborhoods. For each artist, we compute the weak-tie fraction:
+\begin{equation}
+\text{weak\_tie\_frac}(i)
+= \frac{|\{j \in N(i): s_{ij} \le 1\}|}{\deg(i)}.
+\end{equation}
+When $\deg(i)=0$, we set $\text{weak\_tie\_frac}(i)=0$. In sensitivity analyses (reported in the Appendix), we verified that results are qualitatively stable under alternative thresholds (e.g., $s_{ij}\le 0$ or $s_{ij}\le 2$).
+
+We further quantify cross-community connectivity using a Louvain partition of the early-career graph (NetworkX \texttt{louvain\_communities} with a fixed random seed). For each node, we compute a simple participation measure: the fraction of its neighbors assigned to a different Louvain community (set to 0 for isolates).
+
+\subsubsection*{Distance-to-Neighborhood Opportunity}
+To capture opportunities for expansion beyond an artist’s immediate collaborators, we compute \texttt{open\_dyads}: for each node, we form the two-hop neighborhood (union of neighbors and neighbors-of-neighbors) and count the number of nodes at two hops that are not already one-hop neighbors. This yields a nonnegative count summarizing potential new collaborator candidates reachable through existing ties (and is 0 for isolates).
+
+\subsubsection*{Node2Vec Embeddings}
+We complement hand-engineered features with latent node representations learned using node2vec \cite{Grover2016Node2Vec}. Given an undirected graph, node2vec generates biased second-order random walks to capture higher-order structural similarity and community organization that are not fully reflected in engineered graph metrics. We trained $d=32$ dimensional embeddings for each node using weighted random walks. Specifically, for each node we simulated $8$ random walks of length $10$. The return and in--out hyperparameters were set to $p=1.0$ and $q=1.0$, corresponding to an unbiased walk that interpolates between breadth-first and depth-first sampling.
+
+Edge weights (collaboration counts) were incorporated directly into the walk transition probabilities. Embeddings were learned using the skip-gram objective with a context window size of $10$ and minimum node frequency of $1$.
+
+We used the Python \texttt{node2vec} implementation with \texttt{networkx} graphs. All node2vec hyperparameters were fixed \emph{a priori} to commonly used defaults and were not further tuned. The resulting 32-dimensional vectors
+$(n2v_0, \dots, n2v_{31})$
+were concatenated with all engineered features and used as input to downstream predictive models.
+
+
+\subsubsection*{Preprocessing for Regression Models}
+All network features are computed as described above and then combined with the non-network covariates for regression. Features with heavy right tails (e.g., degree and component size) are included both in raw form and, where noted, in $\log(1+x)$ form; additionally, continuous predictors are standardized (z-scored) using statistics computed on the training split only and applied unchanged to validation/test splits to avoid information leakage during model evaluation.
+
+
+\subsection*{Predictive Modeling}
+Having constructed early-career feature representations for each artist, we next develop regression models to predict long-term commercial success. 
+
+\subsubsection*{Target Transformation and Evaluation Metrics}
+
+The target is each artist's current Spotify follower count. Because follower counts are highly right-skewed with a heavy tail, we model the natural logarithm of follower count rather than the raw scale. All predictive models are therefore trained to approximate
+\[
+    y_i = \log(\text{followers}_i),
+\]
+and all error metrics are computed with respect to this log-transformed target.
+
+To evaluate model performance, we report root mean squared error on the log scale (log-RMSE) and the coefficient of determination on the log scale (log-$R^2$). Log-RMSE reflects typical multiplicative error in follower counts, while log-$R^2$ quantifies the proportion of variance in log-followers explained by the model. Lower log-RMSE and higher log-$R^2$ indicate better performance.
+
+\subsubsection*{Model Choice}
+
+We experimented with two gradient-boosting frameworks commonly used for tabular regression: \texttt{XGBoostRegressor} and \texttt{CatBoostRegressor} \cite{Chen2016XGBoost, prokhorenkova2018catboost}. Both models were trained on identical feature sets and evaluated using the same cross-validation protocol described below. Across all feature configurations, CatBoost consistently achieved lower log-RMSE and higher log-$R^2$ than XGBoost. 
+
+CatBoost offers two practical advantages in our setting. First, it natively handles categorical predictors without requiring one-hot encoding, which is well aligned with our extensive use of categorical metadata (e.g., genre, label, country, region, and role). Second, it does not require explicit feature scaling, simplifying the integration of heterogeneous numeric features such as centrality, track counts, and embedding dimensions. Given its superior empirical performance and favorable inductive biases, we adopt CatBoost as our primary regression model and focus all subsequent analyses on CatBoost results.
+
+\subsubsection*{Feature Set Definitions}
+
+To assess the contribution of different information sources, we organize the artist-level predictors into three primary feature groups, as described in the Feature Engineering section:
+
+\begin{itemize}
+    \item \textbf{Base features:} Non-network artist attributes capturing activity cadence, label and genre information, primary creative role, location, and years active.
+    \item \textbf{Graph features:} All hand-engineered network features, including degree and centralities, component and distance measures, triadic and closure statistics, homophily indicators, weak-tie and bridging measures, and ERGM-aligned diagnostics.
+    \item \textbf{Node2vec embeddings (\texttt{n2v}):} Learned structural embeddings derived from weighted random walks on the early-career collaboration graph.
+\end{itemize}
+
+We construct models using each individual feature group, all pairwise combinations, and the full feature set: \texttt{base}, \texttt{graph}, \texttt{n2v}, \texttt{base+graph}, \texttt{base+n2v}, \texttt{graph+n2v}, and \texttt{base+graph+n2v}. This design enables us to isolate and quantify the incremental predictive value of network structure and learned embeddings beyond non-network career attributes. All features are used as-is, without explicit feature selection. Regularization is instead achieved through CatBoost hyperparameter tuning, including ridge (L2) regularization, feature subsampling, and structural regularization. Missing values are handled using CatBoost’s built-in mechanisms, which natively support missing data without prior imputation.
+
+\subsubsection*{Training and Validation Procedure}
+
+All models are trained at the artist level. We first apply a natural logarithmic transformation to artist follower counts and partition the transformed values into ten quantile-based bins. These bins are used to stratify the data when randomly splitting artists into training and test sets with an 80/20 split, ensuring that the follower count distribution is preserved across splits. The test set is held out for final evaluation, while model selection, hyperparameter tuning, and feature set comparisons are conducted exclusively on the training set.
+
+For each feature set, we first estimate generalization performance using 5-fold cross-validation. The training artists are partitioned into five folds; for each fold, a CatBoost model is trained on four-fifths of the data and evaluated on the remaining fifth using log-RMSE and log-\(R^2\). We report the mean and standard deviation of these metrics across folds in Table~1 to highlight the generalization performance across feature sets.
+
+After cross-validation, we perform hyperparameter tuning using a random search with thirty iterations over the full training dataset, optimizing negative log-RMSE. Using the selected hyperparameters, we train a final CatBoost model and report its performance on the held-out test set.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% BIBLIOGRAPHY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{thebibliography}{99}
+
+\bibitem{Kang2022Musicians}
+I.~Kang, M.~Mandulak, and B.~K. Szymanski, ``Analyzing and predicting success of professional musicians,'' \emph{Scientific Reports}, vol.~12, no.~21838, 2022. [Online]. Available: \url{https://www.nature.com/articles/s41598-022-25430-9}
+
+\bibitem{Silva2019SAC}
+M.~O.~Silva, L.~M.~Rocha, and M.~M.~Moro, ``Collaboration profiles and their impact on musical success,'' in \emph{Proc. 34th ACM/SIGAPP Symp. Applied Computing (SAC)}, 2019, pp. 2070--2077.
+
+\bibitem{Oliveira2020ISMIR}
+G.~P.~Oliveira, M.~O.~Silva, D.~B.~Seufitelli, A.~Lacerda, and M.~M.~Moro, ``Detecting collaboration profiles in success-based music genre networks,'' in \emph{Proc. 21st Int. Soc. Music Information Retrieval Conf. (ISMIR)}, 2020, pp. 726--732. [Online]. Available: \url{http://archives.ismir.net/ismir2020/paper/000275.pdf}
+
+\bibitem{Oliveira2021Thesis}
+G.~P.~Oliveira, ``Analyses of musical success based on time, genre and collaboration,'' M.S. thesis, Universidade Federal de Minas Gerais, Belo Horizonte, Brazil, 2021. [Online]. Available: \url{https://repositorio.ufmg.br/handle/1843/47347}
+
+\bibitem{Silva2019WebMedia}
+M.~O.~Silva and M.~M.~Moro, ``Causality analysis between collaboration profiles and musical success,'' in \emph{Proc. Brazilian Symp. Multimedia and the Web (WebMedia)}, 2019, pp. 369--376. [Online]. Available: \url{https://sol.sbc.org.br/index.php/webmedia/article/view/8049}
+
+\bibitem{MartinezAlbeniz2023MusicIndustry}
+A.~Deshmane and V.~Mart{\'i}nez-de-Alb{\'e}niz, ``Come together, right now? An empirical study of collaborations in the music industry,'' \emph{Management Science}, vol.~69, no.~12, pp. 7217--7235, 2023.
+
+\bibitem{Xue2014LyricsSuccess}
+A.~Xue and N.~Dupoux, ``Predicting a song’s commercial success based on lyrics and other metrics,'' Project Report, Stanford Univ., 2014. [Online]. Available: \url{https://cs229.stanford.edu/proj2014/Angela%20Xue%2C%20Nick%20Dupoux%2C%20Predicting%20the%20Commercial%20Success%20of%20Songs%20Based%20on%20Lyrics%20and%20Other%20Metrics.pdf}
+
+\bibitem{Choudhary2021Multimodal}
+Y.~Choudhary and P.~Rao, ``Literature survey: Multimodal prediction for music popularity,'' Tech. Rep., IIT Bombay, 2021. [Online]. Available: \url{https://www.cfilt.iitb.ac.in/resources/surveys/2025/survey-yashchoudhary-multimodal-prediction-for-music-popularity.pdf}
+
+\bibitem{McVicar2011HitSongScience}
+Y.~Ni, R.~Santos-Rodríguez, M.~McVicar, and T.~De~Bie,
+\textit{Hit Song Science Once Again a Science?}
+(2011).
+Available at: \url{https://www.academia.edu/18863015/Hit_Song_Science_Once_Again_a_Science}.
+
+\bibitem{Zangerle2019HitSongPrediction}
+E.~Zangerle, R.~Huber, and Y.-H.~M.~Yang, ``Hit song prediction: Leveraging low- and high-level audio features,'' in \emph{Proc. 20th ISMIR}, 2019, pp. 319--326.
+
+\bibitem{prokhorenkova2018catboost}
+L.~Prokhorenkova, G.~Gusev, A.~Vorobev, A.~V.~Dorogush, and A.~Gulin,
+``CatBoost: Unbiased Boosting with Categorical Features,''
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 
+vol.~31, pp.~6639--6649, 2018. 
+[Online]. Available: \url{https://arxiv.org/abs/1706.09516}
+
+\bibitem{Granovetter1973WeakTies}
+M.~S.~Granovetter, ``The strength of weak ties,'' \emph{American Journal of Sociology}, vol.~78, no.~6, pp. 1360--1380, 1973.
+
+\bibitem{Burt1992StructuralHoles}
+R.~S.~Burt, \emph{Structural Holes: The Social Structure of Competition}. Cambridge, MA: Harvard Univ. Press, 1992.
+
+\bibitem{Wasserman1994SNA}
+S.~Wasserman and K.~Faust, \emph{Social Network Analysis: Methods and Applications}. Cambridge, U.K.: Cambridge Univ. Press, 1994.
+
+\bibitem{Robins2007IntroERGM}
+G.~Robins, P.~Pattison, Y.~Kalish, and D.~Lusher, ``An introduction to exponential random graph (p*) models for social networks,'' \emph{Social Networks}, vol.~29, no.~2, pp. 173--191, 2007.
+
+\bibitem{Grover2016Node2Vec}
+A.~Grover and J.~Leskovec, ``node2vec: Scalable feature learning for networks,'' in \emph{Proc. 22nd ACM SIGKDD Int. Conf. Knowledge Discovery and Data Mining}, 2016, pp. 855--864.
+
+\bibitem{Chen2016XGBoost}
+T.~Chen and C.~Guestrin, ``XGBoost: A scalable tree boosting system,'' in \emph{Proc. 22nd ACM SIGKDD Int. Conf. Knowledge Discovery and Data Mining}, 2016, pp. 785--794.
+
+\bibitem{MusicBrainz}
+MusicBrainz, ``MusicBrainz: The open music encyclopedia.'' [Online]. Available: \url{https://musicbrainz.org/}
+
+\bibitem{SpotifyAPI}
+Spotify, ``Spotify Web API.'' [Online]. Available: \url{https://developer.spotify.com/documentation/web-api}
+
+\end{thebibliography}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REQUIRED NATURE SECTIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section*{Acknowledgements}
+The authors received no specific funding for this work.
+
+\section*{Author contributions statement}
+I.M. conceived the study. C.F. and K.W. conducted the analyses. C.F., K.W., and I.M. interpreted the results and contributed to the writing of the manuscript. All authors reviewed and approved the final manuscript. 
+
+\section*{Competing interests}
+The authors declare no competing interests.
+
+\section*{Data availability}
+MusicBrainz data used in this study are publicly accessible at \url{https://musicbrainz.org/doc/MusicBrainz_Database}. Spotify metadata were obtained via the Spotify Web API: https://developer.spotify.com/documentation/web-api, in accordance with its terms of use. The processed datasets generated during the current study are available from the authors upon reasonable request.
+
+\section*{Code availability}
+All analysis code used in this study  is available at \\
+\url{https://github.com/TheDeafOne/collaborative-success-research}.
+
+\end{document}
